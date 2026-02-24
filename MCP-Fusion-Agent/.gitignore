@@ -1,0 +1,118 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+venv*/
+env*/
+app_data
+app
+# Pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# pyenv-virtualenv
+.python-version
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Testing / coverage
+.coverage
+.coverage.*
+.pytest_cache/
+.pytest_cache
+nosetests.xml
+coverage.xml
+htmlcov/
+.tox/
+.cache/
+
+# Logs and databases
+*.log
+*.sqlite3
+*.db
+
+# Local settings
+local_settings.py
+instance/
+.webassets-cache
+
+# Editor/IDE
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# JetBrains
+*.iml
+
+# macOS
+*.DS_Store
+.AppleDouble
+.LSOverride
+
+# Thumbnails
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# mypy / pyright
+.mypy_cache/
+.pyright/
+
+# Coverage and profiling
+.prof
+
+# Secrets / environment
+.env
+.env.*
+secrets.json
+
+# Misc
+*.bak
+*.tmp
+*.swp
+
+# Node
+node_modules/
+
+# Distribution artifacts
+dist/
+build/
+.eggs/
+*.egg-info/
+
+# Wheels
+*.whl
+
+# Terraform
+*.tfstate
+*.tfstate.*
+
+../.DS_Store
+# End of .gitignore
