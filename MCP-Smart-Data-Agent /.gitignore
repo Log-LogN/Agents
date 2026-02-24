@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Local config
+.env
+
+# IDE
+.idea/
+
+# Logs and generated outputs
+outputs/*.log
+outputs/*.txt
+
+# macOS
+.DS_Store
