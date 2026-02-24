@@ -9,8 +9,6 @@ It uses an MCP server (`FastMCP`) and an OpenAI model for supervisor routing + t
 ## Request Flow
 ![img_1.png](img_1.png)
 
-## Why this name
-**MCP Fusion Agent** fits this repository because it fuses multiple specialized agents behind one chat interface through MCP.
 
 ## Repository Structure
 - `agent/` - supervisor, routing logic, MCP client, and main agent service
