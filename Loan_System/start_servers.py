@@ -28,9 +28,10 @@ def shutdown(sig=None, frame=None):
         except: pass
     sys.exit(0)
 
-signal.signal(signal.SIGINT,  shutdown)
-signal.signal(signal.SIGTERM, shutdown)
-atexit.register(shutdown)
+def main():
+    signal.signal(signal.SIGINT,  shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+    atexit.register(shutdown)
 
 print("=" * 60)
 print("  🏦 Loan & Credit Multi-Agent System — MCP Servers")
