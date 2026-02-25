@@ -6,15 +6,16 @@ This document provides a detailed, step-by-step explanation of the **Multi-Agent
 
 ## 1. System Overview
 
-The Hospital Management System is a **Multi-Agent System (MAS)** built using the **Model Context Protocol (MCP)** and **LangGraph**. It consists of a central "Supervisor" agent that routes user requests to six specialized agents, each backed by its own MCP server.
+The Hospital Management System is a **Multi-Agent System (MAS)** built using the **Model Context Protocol (MCP)** and **LangGraph**. It consists of a central **Supervisor Agent** (running as a standalone FastAPI HTTP server on port 9001) that routes user requests to six specialized agents, each backed by its own MCP server.
 
 ### Core Features:
 
+- **Supervisor Agent**: Standalone HTTP server (port 9001) with streaming support (SSE) for intelligent routing.
 - **Specialized Agents**: 6 distinct departments (Appointment, Billing, Inventory, Pharmacy, Lab, Ward).
 - **Intelligent Routing**: Automated task delegation based on user intent.
 - **RBAC (Role-Based Access Control)**: Different levels of access for Patients, Front Desk, Billing, and Admin.
 - **Persistent Storage**: PostgreSQL database for managing patients, doctors, inventory, and more.
-- **Interactive UI**: Streamlit-based dashboard with real-time execution tracing.
+- **Interactive UI**: Streamlit-based dashboard that communicates with the Supervisor over HTTP, with real-time execution tracing.
 
 ---
 
@@ -24,11 +25,11 @@ To visualize how the system works, here is the high-level architecture and the s
 
 ### Architecture Overview
 
-![alt text](<./assets/Patient-Centric Appointment-2026-02-24-051915.png>)
+![alt text](<./assets/Patient-Centric Appointment-2026-02-25-051923.png>)
 
 ### Detailed Sequence Flow
 
-![alt text](<./assets/Patient-Centric Appointment-2026-02-24-051750.png>)
+![alt text](<./assets/Streamlit Application Risk-2026-02-25-051512.png>)
 
 ---
 
@@ -36,6 +37,8 @@ To visualize how the system works, here is the high-level architecture and the s
 
 - **Python**: Core programming language.
 - **FastMCP**: A high-level framework for building MCP servers.
+- **FastAPI + Uvicorn**: HTTP server for the Supervisor Agent (port 9001).
+- **httpx**: HTTP client used by the Streamlit UI to call the Supervisor.
 - **LangGraph & LangChain**: Orchestration of the multi-agent workflow.
 - **PostgreSQL**: Relational database for structured data.
 - **Streamlit**: Modern web framework for the frontend UI.
@@ -47,13 +50,13 @@ To visualize how the system works, here is the high-level architecture and the s
 
 ```text
 Hospital Management/
-├── App.py               # Streamlit UI & Chat Interface
-├── start_servers.py      # Orchestrator to run all 6 MCP servers
+├── App.py                # Streamlit UI (HTTP client to Supervisor)
+├── start_servers.py      # Orchestrator to run all 7 servers
 ├── requirements.txt      # Project dependencies
 ├── .env                  # API keys and database credentials
 ├── database/
-│   └── db.py            # Database schema & initialization logic
-├── mcp_servers/         # Implementation of the 6 MCP servers
+│   └── db.py             # Database schema & initialization logic
+├── mcp_servers/          # Implementation of the 6 MCP servers
 │   ├── appointment_server.py
 │   ├── billing_server.py
 │   ├── inventory_server.py
@@ -61,8 +64,9 @@ Hospital Management/
 │   ├── lab_server.py
 │   └── ward_server.py
 ├── supervisor/
-│   └── graph.py          # Multi-agent LangGraph logic & routing
-└── utils/               # Shared utilities (Email, Printer, Auth)
+│   ├── graph.py              # Multi-agent LangGraph logic & routing
+│   └── supervisor_server.py  # FastAPI HTTP server (port 9001)
+└── utils/                # Shared utilities (Email, Printer, Auth)
 ```
 
 ---
@@ -82,22 +86,31 @@ Every server in `mcp_servers/` follows a standard pattern:
 3. **Database Integration**: Tools use `database/db.py` to fetch or update data.
 4. **Execution**: The server runs as a background process listening for HTTP requests.
 
-### The 6 Specialized Servers:
+### The 7 Servers:
 
-1. **Appointment (Port 8001)**: Handles `register_patient`, `book_appointment`, `cancel_appointment`, etc.
-2. **Billing (Port 8002)**: Manages `generate_invoice`, `get_patient_bill`, and `revenue_summary`.
-3. **Inventory (Port 8003)**: Tracks stock levels and handles `update_stock` and `reorder_alerts`.
-4. **Pharmacy (Port 8004)**: Manages `create_prescription` and `dispense_medication`.
-5. **Lab (Port 8005)**: Handles `order_lab_test` and `get_patient_lab_results`.
-6. **Ward (Port 8006)**: Manages `get_bed_availability` and `assign_bed`.
+| #   | Server          | Port | Type    | Key Tools                                          |
+| --- | --------------- | ---- | ------- | -------------------------------------------------- |
+| 1   | **Supervisor**  | 9001 | FastAPI | `/invoke`, `/stream`, `/health`                    |
+| 2   | **Appointment** | 8001 | MCP     | `register_patient`, `book_appointment`, etc.       |
+| 3   | **Billing**     | 8002 | MCP     | `generate_invoice`, `get_patient_bill`, etc.       |
+| 4   | **Inventory**   | 8003 | MCP     | `update_stock`, `reorder_alerts`, etc.             |
+| 5   | **Pharmacy**    | 8004 | MCP     | `create_prescription`, `dispense_medication`, etc. |
+| 6   | **Lab**         | 8005 | MCP     | `order_lab_test`, `get_patient_lab_results`, etc.  |
+| 7   | **Ward**        | 8006 | MCP     | `get_bed_availability`, `assign_bed`, etc.         |
 
 ---
 
-## 5. Multi-Agent Supervisor Logic (`graph.py`)
+## 5. Multi-Agent Supervisor Logic
 
-The **Supervisor Agent** acts as a dispatcher. It uses **LangGraph** to manage the state and transitions between agents.
+The **Supervisor Agent** runs as a standalone FastAPI server (`supervisor/supervisor_server.py`) on **port 9001**. It uses **LangGraph** (`supervisor/graph.py`) to manage the state and transitions between agents.
 
-### Step-by-Step Implementation:
+### Supervisor Server Endpoints:
+
+- **`POST /invoke`** — Accepts messages + actor context as JSON, runs the full agent pipeline, returns messages + trace + final reply.
+- **`POST /stream`** — Same input, but streams trace steps and the final reply via Server-Sent Events (SSE).
+- **`GET /health`** — Simple health check.
+
+### Step-by-Step Agent Flow:
 
 1. **State Definition**: A `SupervisorState` object holds the message history and current user context.
 2. **Dynamic Tool Scoping**: Depending on the user's role (e.g., "Patient"), only specific tools are "exposed" to the agent.
@@ -138,15 +151,15 @@ Run the following command in your terminal:
 pip install -r requirements.txt
 ```
 
-### Step 4: Start the MCP Servers
+### Step 4: Start All Servers
 
-Run the orchestrator script. This will initialize the database and start all 6 servers in parallel:
+Run the orchestrator script. This will initialize the database and start all 7 servers (1 Supervisor + 6 MCP) in parallel:
 
 ```bash
 python start_servers.py
 ```
 
-_Wait until you see `[READY] All 6 MCP servers running!`_
+_Wait until you see `[READY] All 7 servers running (Supervisor + 6 MCP)!`_
 
 ### Step 5: Start the Streamlit UI
 

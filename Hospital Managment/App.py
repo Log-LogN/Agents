@@ -9,11 +9,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import httpx
 import streamlit as st
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from database.db import init_db
-from supervisor.graph import run_sync
+SUPERVISOR_URL = "http://127.0.0.1:9001"
 
 st.set_page_config(
     page_title="Hospital Management System",
@@ -87,7 +87,7 @@ QUICK = {
     "Critical Lab Values": "Show any critical lab results",
 }
 
-# Database is initialized by start_servers.py; App.py assumes it's already set up.
+# Session state initialization
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "trace_log" not in st.session_state:
@@ -95,11 +95,61 @@ if "trace_log" not in st.session_state:
 if "trace_cursor" not in st.session_state:
     st.session_state.trace_cursor = 0
 
+# Helper: convert LangChain message -> dict for HTTP
+def _msg_to_dict(msg) -> dict:
+    if isinstance(msg, HumanMessage):
+        return {"type": "human", "content": msg.content}
+    elif isinstance(msg, AIMessage):
+        d = {"type": "ai", "content": msg.content}
+        if getattr(msg, "tool_calls", None):
+            d["tool_calls"] = msg.tool_calls
+        return d
+    elif isinstance(msg, ToolMessage):
+        return {
+            "type": "tool",
+            "content": msg.content,
+            "name": getattr(msg, "name", ""),
+            "tool_call_id": getattr(msg, "tool_call_id", ""),
+        }
+    return {"type": "human", "content": str(msg)}
+
+
+# Helper: convert dict -> LangChain message from HTTP response
+def _dict_to_msg(d: dict):
+    msg_type = d.get("type", "human")
+    content = d.get("content", "")
+    if msg_type == "human":
+        return HumanMessage(content=content)
+    elif msg_type == "ai":
+        msg = AIMessage(content=content)
+        if d.get("tool_calls"):
+            msg.tool_calls = d["tool_calls"]
+        return msg
+    elif msg_type == "tool":
+        return ToolMessage(
+            content=content,
+            name=d.get("name", ""),
+            tool_call_id=d.get("tool_call_id", ""),
+        )
+    return HumanMessage(content=content)
+
+
 def run_agent(user_text: str):
     st.session_state.messages.append(HumanMessage(content=user_text))
-    result = run_sync(st.session_state.messages)
 
-    st.session_state.messages = result["messages"]
+    # Serialize messages for HTTP transport
+    payload = {
+        "messages": [_msg_to_dict(m) for m in st.session_state.messages],
+        "actor": None,
+    }
+
+    with httpx.Client(timeout=120.0) as client:
+        resp = client.post(f"{SUPERVISOR_URL}/invoke", json=payload)
+        resp.raise_for_status()
+        result = resp.json()
+
+    # Deserialize messages back to LangChain objects
+    st.session_state.messages = [_dict_to_msg(m) for m in result["messages"]]
     full_trace = result.get("trace", [])
     prev_cursor = st.session_state.trace_cursor
 
@@ -168,88 +218,93 @@ def render_trace(trace):
                 )
 
 
-with st.sidebar:
-    st.markdown("## Hospital Management System")
-    st.markdown("---")
-    st.markdown("### Quick Actions")
+def main():
+    with st.sidebar:
+        st.markdown("## Hospital Management System")
+        st.markdown("---")
+        st.markdown("### Quick Actions")
 
-    for label, msg in QUICK.items():
-        if st.button(label, key=f"q_{label}"):
-            st.session_state.pending = msg
+        for label, msg in QUICK.items():
+            if st.button(label, key=f"q_{label}"):
+                st.session_state.pending = msg
 
-    st.markdown("---")
-    st.markdown("### Agents Online")
-    for agent, icon in AGENT_ICONS.items():
-        color = AGENT_COLORS[agent]
-        st.markdown(
-            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
-            f'<span style="font-size:14px">{icon}</span>'
-            f'<span style="color:#e6edf3;font-size:13px;font-weight:500">{agent} Agent</span>'
-            f'<span style="background:{color};width:8px;height:8px;border-radius:50%;display:inline-block"></span>'
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("---")
+        st.markdown("### Agents Online")
+        for agent, icon in AGENT_ICONS.items():
+            color = AGENT_COLORS[agent]
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
+                f'<span style="font-size:14px">{icon}</span>'
+                f'<span style="color:#e6edf3;font-size:13px;font-weight:500">{agent} Agent</span>'
+                f'<span style="background:{color};width:8px;height:8px;border-radius:50%;display:inline-block"></span>'
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-    st.markdown("---")
-    if st.button("Clear Chat"):
-        st.session_state.messages = []
-        st.session_state.trace_log = []
-        st.session_state.trace_cursor = 0
+        st.markdown("---")
+        if st.button("Clear Chat"):
+            st.session_state.messages = []
+            st.session_state.trace_log = []
+            st.session_state.trace_cursor = 0
+            st.rerun()
+
+        st.caption("LangGraph Supervisor + 6 MCP Servers + PostgreSQL")
+
+    st.markdown(
+        """
+    <div class="header-box">
+      <h1 style="margin:0">Hospital Management System - Multi-Agent System</h1>
+      <p style="margin-top:6px">Supervisor routes your request to the right specialist agent automatically.</p>
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
+    chat_col = st.container()
+
+    with chat_col:
+        if not st.session_state.messages:
+            st.markdown("### Welcome")
+            st.markdown("Use Quick Actions or type a request in chat.")
+            st.markdown("---")
+
+        trace_idx = 0
+        for msg in st.session_state.messages:
+            if isinstance(msg, HumanMessage):
+                with st.chat_message("user", avatar="👤"):
+                    st.write(msg.content)
+            elif isinstance(msg, AIMessage) and msg.content and not getattr(msg, "tool_calls", None):
+                with st.chat_message("assistant", avatar="🤖"):
+                    st.write(msg.content)
+                    if trace_idx < len(st.session_state.trace_log):
+                        render_trace(st.session_state.trace_log[trace_idx])
+                trace_idx += 1
+
+    if "pending" in st.session_state:
+        pending_message = st.session_state.pop("pending")
+        with chat_col:
+            with st.chat_message("user", avatar="👤"):
+                st.write(pending_message)
+            with st.chat_message("assistant", avatar="🤖"):
+                with st.spinner("Supervisor is routing..."):
+                    reply, trace = run_agent(pending_message)
+                st.write(reply)
+                render_trace(trace)
         st.rerun()
 
-    st.caption("LangGraph Supervisor + 6 MCP Servers + PostgreSQL")
+    with chat_col:
+        user_input = st.chat_input("Ask anything. Example: 'Book appointment', 'Check stock', 'Show my bill'.")
 
-st.markdown(
-    """
-<div class="header-box">
-  <h1 style="margin:0">Hospital Management System - Multi-Agent System</h1>
-  <p style="margin-top:6px">Supervisor routes your request to the right specialist agent automatically.</p>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-chat_col = st.container()
-
-with chat_col:
-    if not st.session_state.messages:
-        st.markdown("### Welcome")
-        st.markdown("Use Quick Actions or type a request in chat.")
-        st.markdown("---")
-
-    trace_idx = 0
-    for msg in st.session_state.messages:
-        if isinstance(msg, HumanMessage):
+    if user_input:
+        with chat_col:
             with st.chat_message("user", avatar="👤"):
-                st.write(msg.content)
-        elif isinstance(msg, AIMessage) and msg.content and not getattr(msg, "tool_calls", None):
+                st.write(user_input)
             with st.chat_message("assistant", avatar="🤖"):
-                st.write(msg.content)
-                if trace_idx < len(st.session_state.trace_log):
-                    render_trace(st.session_state.trace_log[trace_idx])
-            trace_idx += 1
+                with st.spinner("Supervisor is routing to the right agent..."):
+                    reply, trace = run_agent(user_input)
+                st.write(reply)
+                render_trace(trace)
 
-if "pending" in st.session_state:
-    pending_message = st.session_state.pop("pending")
-    with chat_col:
-        with st.chat_message("user", avatar="👤"):
-            st.write(pending_message)
-        with st.chat_message("assistant", avatar="🤖"):
-            with st.spinner("Supervisor is routing..."):
-                reply, trace = run_agent(pending_message)
-            st.write(reply)
-            render_trace(trace)
-    st.rerun()
 
-with chat_col:
-    user_input = st.chat_input("Ask anything. Example: 'Book appointment', 'Check stock', 'Show my bill'.")
-
-if user_input:
-    with chat_col:
-        with st.chat_message("user", avatar="👤"):
-            st.write(user_input)
-        with st.chat_message("assistant", avatar="🤖"):
-            with st.spinner("Supervisor is routing to the right agent..."):
-                reply, trace = run_agent(user_input)
-            st.write(reply)
-            render_trace(trace)
+if __name__ == "__main__":
+    main()

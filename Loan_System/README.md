@@ -33,13 +33,12 @@
 │                        STREAMLIT UI (app.py)                     │
 │                  User types message / clicks quick action        │
 └──────────────────────┬───────────────────────────────────────────┘
-                       │ HumanMessage
+                       │ HTTP POST (port 9001)
                        ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│               SUPERVISOR AGENT (LangGraph StateGraph)            │
-│     Reads the user message and decides which specialist to call  │
-│     Uses GPT-4o-mini with "handoff" tools (transfer_to_*)        │
-│     NEVER answers directly — only routes                         │
+│               SUPERVISOR SERVER (supervisor_server.py)           │
+│     FastAPI server exposing LangGraph on port 9001               │
+│     Decides which specialist agent should handle the task        │
 └──────┬──────────┬──────────┬──────────┬──────────┬───────────────┘
        │          │          │          │          │
        ▼          ▼          ▼          ▼          ▼
@@ -75,7 +74,7 @@
 
 ### 📊 Diagram 4 — MCP Communication Protocol
 
-![alt text](./assets/Streamlit%20Application%20Risk-2026-02-24-101449.png)
+![alt text](./assets/Patient-Centric%20Appointment-2026-02-25-072631.png)
 
 **Key Concepts:**
 
@@ -148,18 +147,18 @@ Loan_System/
 ├── .env                          # Environment variables (API keys, DB credentials)
 ├── .env.example                  # Template for .env
 ├── requirements.txt              # Python dependencies
-├── start_servers.py              # Launches all 5 MCP servers as subprocesses
-├── app.py                        # Streamlit UI (frontend)
-│
-├── supervisor/
-│   └── graph.py                  # LangGraph supervisor + specialist agent graph
-│
 ├── mcp_servers/
 │   ├── application_server.py     # Port 8001 — Loan application tools
 │   ├── kyc_server.py             # Port 8002 — KYC & fraud detection tools
 │   ├── credit_risk_server.py     # Port 8003 — Credit scoring tools
 │   ├── underwriting_server.py    # Port 8004 — Approval/rejection tools
 │   └── repayment_server.py       # Port 8005 — Payment & collections tools
+│
+├── supervisor/
+│   ├── graph.py                  # LangGraph supervisor + specialist agent graph
+│   └── supervisor_server.py      # Port 9001 — FastAPI server for the Supervisor
+│
+├── start_servers.py              # Launches all 6 servers (5 MCP + 1 Supervisor)
 │
 ├── database/
 │   └── db.py                     # PostgreSQL schema + seed data
@@ -568,13 +567,14 @@ Launches all 5 MCP servers as **subprocess.Popen** child processes from a single
   🏦 Loan & Credit Multi-Agent System — MCP Servers
 ============================================================
 
+  [OK]  Supervisor     -> http://127.0.0.1:9001/mcp   (PID: 12344)
   [OK]  Application    -> http://127.0.0.1:8001/mcp   (PID: 12345)
   [OK]  KYC            -> http://127.0.0.1:8002/mcp   (PID: 12346)
   [OK]  Credit Risk    -> http://127.0.0.1:8003/mcp   (PID: 12347)
   [OK]  Underwriting   -> http://127.0.0.1:8004/mcp   (PID: 12348)
   [OK]  Repayment      -> http://127.0.0.1:8005/mcp   (PID: 12349)
 
-  [READY]  All 5 MCP servers are running!
+  [READY]  All 6 servers are running!
 
   ->  Open a NEW terminal and run:   streamlit run app.py
 
@@ -751,21 +751,23 @@ return g.compile()
 START → supervisor → (conditional) → specialist_agent → END
 ```
 
-### 9.7 Public API
+### 9.8 Supervisor Server (`supervisor/supervisor_server.py`)
+
+The supervisor graph is wrapped in a **FastAPI** server that runs on port **9001**. This decouples the AI logic from the UI and allows for asynchronous execution over HTTP.
 
 ```python
-async def ainvoke(messages: list) -> dict:
-    graph  = await _build_graph()
-    result = await graph.ainvoke({"messages": messages})
-    # Build trace from new messages
-    # Extract final AI reply
-    return {"messages": msgs, "final_reply": final, "trace": trace}
+from fastapi import FastAPI
+from supervisor.graph import ainvoke
 
-def run_sync(messages: list) -> dict:
-    """Synchronous wrapper — safe to call from Streamlit."""
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(ainvoke(messages))
+app = FastAPI()
+
+@app.post("/chat")
+async def process_chat(request: ChatRequest):
+    result = await ainvoke(request.messages)
+    return result
 ```
+
+The server handles converting the list of chat messages into LangChain message objects, running the graph, and serializing the results (including the routing trace) back to JSON.
 
 ### 9.8 Trace Building
 
@@ -824,11 +826,13 @@ Contains:
 # 1. User types a message (or clicks a quick action)
 user_input = st.chat_input("Ask anything...")
 
-# 2. Message is passed to the supervisor graph
+# 2. Message is passed to the supervisor server via HTTP
 def run_agent(user_text):
     st.session_state.messages.append(HumanMessage(content=user_text))
-    result = run_sync(st.session_state.messages)  # Calls graph.py
-    st.session_state.messages = result["messages"]
+    # Calls the FastAPI server on port 9001
+    resp = requests.post("http://127.0.0.1:9001/chat", json={"messages": msgs_for_mcp})
+    result = resp.json()
+    st.session_state.messages = update_history(result["messages"])
     st.session_state.trace_log.append(result["trace"])
     return result["final_reply"], result["trace"]
 
@@ -908,16 +912,16 @@ EMAIL_SENDER=your_email@gmail.com
 EMAIL_APP_PASSWORD=your_app_password
 ```
 
-### Step 3: Start all MCP servers (Terminal 1)
+### Step 3: Start all servers (Terminal 1)
 
 ```bash
 python start_servers.py
 ```
 
-This starts 5 servers on ports 8001–8005. Wait until you see:
+This starts 6 servers on ports 8001–8005 and 9001. Wait until you see:
 
 ```
-[READY]  All 5 MCP servers are running!
+[READY]  All 6 servers are running!
 ```
 
 ### Step 4: Start the Streamlit UI (Terminal 2)
@@ -955,8 +959,7 @@ This opens the UI at `http://localhost:8501`.
                                 ▼
 ┌─ Step 2: app.py receives input ──────────────────────────────────────────┐
 │  st.session_state.messages.append(HumanMessage(content=user_text))       │
-│  result = run_sync(st.session_state.messages)                            │
-│  → Calls graph.py synchronously                                          │
+│  → Sends HTTP POST to http://127.0.0.1:9001/chat                         │
 └──────────────────────────────────────────────────────────────────────────┘
                                 │
                                 ▼
