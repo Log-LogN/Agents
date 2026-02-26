@@ -6,8 +6,8 @@ loads tools into LangChain format, and runs a ReAct-style
 agent loop using OpenAI GPT-4o.
 
 Flow:
-    user message → agent node (LLM decides tool) → tool node (MCP call)
-    → agent node (LLM sees result) → ... → final answer
+    user message → reasoning node → agent node (LLM decides tools once)
+    → optional tool node (single pass) → summarize node → final answer
 """
 
 import sys
@@ -18,7 +18,7 @@ import ast
 from typing import Annotated, TypedDict
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -32,6 +32,8 @@ from shared.github_client import GitHubClient, GitHubAPIError
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    execution_brief: str
+    final_output: str
 
 
 # ── System prompt ────────────────────────────────────────────────────────────
@@ -42,6 +44,12 @@ SYSTEM_PROMPT = SystemMessage(content=(
     "search code. Use them as needed to answer the user's question accurately. "
     "When showing code or file contents, always use markdown code blocks. "
     "Be concise but complete in your answers."
+))
+
+SUMMARY_SYSTEM_PROMPT = SystemMessage(content=(
+    "You are finalizing a GitHub agent run. Summarize the completed tool-assisted analysis "
+    "into a clear final answer for the user. Include concrete findings and next actions when useful. "
+    "Do not mention internal graph nodes."
 ))
 
 
@@ -85,30 +93,65 @@ async def build_graph():
 
     # ── Nodes ──────────────────────────────────────────────────────────────
 
+    async def reasoning_node(state: AgentState) -> AgentState:
+        """
+        First node for every run.
+        Builds a compact execution brief that guides tool selection and answer style.
+        """
+        user_text = ""
+        for msg in reversed(state["messages"]):
+            if isinstance(getattr(msg, "content", None), str) and msg.content:
+                user_text = msg.content.strip()
+                break
+        brief = (
+            "Plan: identify repo/owner context, gather only required GitHub facts via tools, "
+            "then provide a concise, evidence-backed answer. "
+            f"User request: {user_text[:400]}"
+        )
+        return {"execution_brief": brief}
+
     async def agent_node(state: AgentState) -> AgentState:
         """LLM decides whether to call a tool or return final answer."""
-        messages = [SYSTEM_PROMPT] + state["messages"]
+        guidance = SystemMessage(content=f"Execution brief: {state.get('execution_brief', '')}")
+        messages = [SYSTEM_PROMPT, guidance] + state["messages"]
         response = await llm_with_tools.ainvoke(messages)
         return {"messages": [response]}
 
     def should_continue(state: AgentState) -> str:
-        """Route: tool_calls present → tools node, else → END."""
+        """Route: tool_calls present → tools node, else → summarize."""
         last = state["messages"][-1]
         if hasattr(last, "tool_calls") and last.tool_calls:
             return "tools"
-        return END
+        return "summarize"
+
+    async def summarize_node(state: AgentState) -> AgentState:
+        """
+        Final node to produce the user-facing summary response.
+        Keeps tool-loop reasoning separate from final presentation quality.
+        """
+        messages = [SUMMARY_SYSTEM_PROMPT] + state["messages"]
+        summary = await llm.ainvoke(messages)
+        summary_text = summary.content if isinstance(summary.content, str) else str(summary.content)
+        return {
+            "messages": [AIMessage(content=summary_text)],
+            "final_output": summary_text,
+        }
 
     # ── Graph assembly ─────────────────────────────────────────────────────
 
     tool_node = ToolNode(tools)
 
     graph = StateGraph(AgentState)
+    graph.add_node("reasoning", reasoning_node)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", tool_node)
+    graph.add_node("summarize", summarize_node)
 
-    graph.add_edge(START, "agent")
-    graph.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
-    graph.add_edge("tools", "agent")  # loop back after tool execution
+    graph.add_edge(START, "reasoning")
+    graph.add_edge("reasoning", "agent")
+    graph.add_conditional_edges("agent", should_continue, {"tools": "tools", "summarize": "summarize"})
+    graph.add_edge("tools", "summarize")
+    graph.add_edge("summarize", END)
 
     compiled = graph.compile()
     return compiled, mcp_client
@@ -132,12 +175,12 @@ async def run_github_agent(message: str) -> dict:
         initial_state = {"messages": [HumanMessage(content=message)]}
         final_state = await graph.ainvoke(initial_state)
 
-        # Extract final text answer
-        output = ""
-        for msg in reversed(final_state["messages"]):
-            if hasattr(msg, "content") and isinstance(msg.content, str) and msg.content:
-                output = msg.content
-                break
+        output = str(final_state.get("final_output", "") or "")
+        if not output:
+            for msg in reversed(final_state["messages"]):
+                if hasattr(msg, "content") and isinstance(msg.content, str) and msg.content:
+                    output = msg.content
+                    break
 
         # Collect tool call logs
         tool_calls = []
@@ -265,6 +308,10 @@ async def run_github_agent_stream(message: str):
                             yield workflow_evt
                 continue
 
+            # Avoid streaming duplicate partial chunks from final summarize node.
+            if "final_output" in state:
+                continue
+
             if isinstance(getattr(last, "content", None), str) and last.content:
                 yield {
                     "event": "llm_partial",
@@ -272,12 +319,13 @@ async def run_github_agent_stream(message: str):
                     "timestamp": _now_iso(),
                 }
 
-        output = ""
+        output = str(final_state.get("final_output", "") or "") if final_state else ""
         if final_state:
-            for msg in reversed(final_state.get("messages", [])):
-                if hasattr(msg, "content") and isinstance(msg.content, str) and msg.content:
-                    output = msg.content
-                    break
+            if not output:
+                for msg in reversed(final_state.get("messages", [])):
+                    if hasattr(msg, "content") and isinstance(msg.content, str) and msg.content:
+                        output = msg.content
+                        break
 
         yield {"event": "llm_final", "data": {"output": output}, "timestamp": _now_iso()}
 

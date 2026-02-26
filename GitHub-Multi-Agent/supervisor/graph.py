@@ -1,18 +1,7 @@
 """
 Supervisor Agent — LangGraph StateGraph
 ========================================
-Routes user requests to the correct sub-agent via HTTP.
-
-Fixes applied:
-  1. JSON parsing is robust — strips markdown fences OpenAI sometimes adds
-  2. "none" agent returned when query doesn't match any agent
-  3. Routing uses JSON-mode (response_format) so OpenAI always returns pure JSON
-  4. Clear "out of scope" response when no agent matches
-
-To add a new agent (e.g. jira):
-    1. Add JIRA_AGENT_URL to shared/config.py and .env
-    2. Add "jira" to AGENT_REGISTRY + description to AGENT_DESCRIPTIONS
-    3. Done — routing LLM handles the rest automatically
+Routes user requests to specialist sub-agents via a dynamic graph pipeline.
 """
 
 import sys
@@ -22,10 +11,12 @@ import logging
 import re
 import uuid
 import time
+from typing import Literal, TypedDict
 
 import httpx
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END, START, StateGraph
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from shared.config import settings
@@ -36,9 +27,9 @@ logger = logging.getLogger("supervisor")
 
 AGENT_REGISTRY: dict[str, str] = {
     "github": settings.GITHUB_AGENT_URL,
-    # "jira":  settings.JIRA_AGENT_URL,
-    # "slack": settings.SLACK_AGENT_URL,
 }
+DIRECT_ANSWER_AGENT = "direct_answer"
+DEFAULT_FALLBACK_AGENT = DIRECT_ANSWER_AGENT
 
 AGENT_DESCRIPTIONS = """
 - github: All GitHub tasks — repo info (stars, forks, language, description),
@@ -88,13 +79,27 @@ def _clean_json(raw: str) -> str:
     return raw.strip()
 
 
+# ── Graph state ───────────────────────────────────────────────────────────────
+
+RouteStatus = Literal["selected", "out_of_scope", "undetermined"]
+
+
+class SupervisorState(TypedDict, total=False):
+    user_message: str
+    routed_message: str
+    selected_agent: str
+    routing_reason: str
+    route_status: RouteStatus
+    output: str
+    tool_calls: list[dict]
+
+
 # ── Routing logic ─────────────────────────────────────────────────────────────
 
-async def route_to_agent(user_message: str) -> tuple[str, str, str]:
+async def route_to_agent(user_message: str) -> tuple[str, str, str, RouteStatus]:
     """
-    Use the LLM to decide which agent to call.
-    Returns: (agent_name, routed_message, reason)
-    agent_name can be "none" if the query doesn't match any agent.
+    Decide which agent to call.
+    Returns: (agent_name, routed_message, reason, route_status)
     """
     llm = ChatOpenAI(
         model=settings.OPENAI_MODEL,
@@ -112,16 +117,20 @@ async def route_to_agent(user_message: str) -> tuple[str, str, str]:
 
     try:
         routing = json.loads(raw)
-        agent_name = routing.get("agent", "none").lower().strip()
-        routed_message = routing.get("message", user_message)
-        reason = routing.get("reason", "")
+        agent_name = str(routing.get("agent", "none")).lower().strip()
+        routed_message = str(routing.get("message", user_message) or user_message)
+        reason = str(routing.get("reason", "") or "")
 
         if agent_name not in KNOWN_AGENTS:
-            logger.warning(f"LLM returned unknown agent '{agent_name}', treating as none")
-            agent_name = "none"
+            logger.warning(f"LLM returned unknown agent '{agent_name}', treating as undetermined")
+            return "none", user_message, f"unknown-agent '{agent_name}'", "undetermined"
 
-        logger.info(f"Routing decision → agent={agent_name} | reason={reason}")
-        return agent_name, routed_message, reason
+        status: RouteStatus = "selected"
+        if agent_name == "none":
+            status = "out_of_scope"
+
+        logger.info(f"Routing decision → agent={agent_name} | status={status} | reason={reason}")
+        return agent_name, routed_message, reason, status
 
     except (json.JSONDecodeError, KeyError) as e:
         logger.error(f"Routing JSON parse failed: {e!r} | raw='{raw[:200]}'")
@@ -129,9 +138,9 @@ async def route_to_agent(user_message: str) -> tuple[str, str, str]:
         gh_keywords = ["repo", "repository", "issue", "pr", "pull request",
                        "branch", "commit", "github", "code", "star", "fork"]
         if any(kw in user_message.lower() for kw in gh_keywords):
-            logger.warning("Fallback: detected GitHub keywords, routing to github")
-            return "github", user_message, "keyword-based fallback"
-        return "none", user_message, "parse error fallback"
+            logger.warning("Routing parse fallback: detected GitHub keywords")
+            return "github", user_message, "keyword-based fallback", "selected"
+        return "none", user_message, "parse error fallback", "undetermined"
 
 
 # ── HTTP agent caller ─────────────────────────────────────────────────────────
@@ -188,6 +197,26 @@ async def call_agent_stream(agent_name: str, message: str):
                     event_id = line[4:].strip()
 
 
+async def run_direct_answer(message: str) -> str:
+    """Internal fallback agent for undecidable routing."""
+    llm = ChatOpenAI(
+        model=settings.OPENAI_MODEL,
+        api_key=settings.OPENAI_API_KEY,
+        temperature=0.2,
+    )
+    response = await llm.ainvoke([
+        SystemMessage(content=(
+            "You are the default fallback assistant. "
+            "When the supervisor cannot confidently select a specialist agent, "
+            "provide a direct, concise answer and clearly note any missing context."
+        )),
+        HumanMessage(content=message),
+    ])
+    if isinstance(response.content, str):
+        return response.content
+    return str(response.content)
+
+
 # ── Out-of-scope response ─────────────────────────────────────────────────────
 
 OUT_OF_SCOPE_RESPONSE = (
@@ -199,7 +228,133 @@ OUT_OF_SCOPE_RESPONSE = (
 )
 
 
-# ── Main supervisor entry point ───────────────────────────────────────────────
+# ── Graph nodes ───────────────────────────────────────────────────────────────
+
+async def reasoning_node(state: SupervisorState) -> SupervisorState:
+    """
+    Required first node before any agent execution.
+    Produces a normalized routed message for subsequent routing.
+    """
+    cleaned = (state.get("user_message") or "").strip()
+    return {
+        "routed_message": cleaned,
+        "routing_reason": "reasoning-initialized",
+        "route_status": "undetermined",
+    }
+
+
+async def routing_node(state: SupervisorState) -> SupervisorState:
+    agent_name, routed_message, reason, route_status = await route_to_agent(
+        state.get("routed_message") or state.get("user_message", "")
+    )
+    return {
+        "selected_agent": agent_name,
+        "routed_message": routed_message,
+        "routing_reason": reason,
+        "route_status": route_status,
+    }
+
+
+def post_routing_next(state: SupervisorState) -> str:
+    route_status = state.get("route_status", "undetermined")
+    if route_status == "out_of_scope":
+        return "out_of_scope"
+    if route_status == "undetermined":
+        return "fallback"
+    return "execute"
+
+
+async def fallback_node(state: SupervisorState) -> SupervisorState:
+    reason = state.get("routing_reason", "")
+    merged_reason = f"{reason}; default-fallback={DEFAULT_FALLBACK_AGENT}".strip("; ")
+    return {
+        "selected_agent": DEFAULT_FALLBACK_AGENT,
+        "routing_reason": merged_reason,
+        "route_status": "selected",
+    }
+
+
+async def out_of_scope_node(_: SupervisorState) -> SupervisorState:
+    return {
+        "output": OUT_OF_SCOPE_RESPONSE,
+        "selected_agent": "none",
+        "tool_calls": [],
+    }
+
+
+async def execute_agent_node(state: SupervisorState) -> SupervisorState:
+    agent_name = state.get("selected_agent", "none")
+    routed_message = state.get("routed_message", state.get("user_message", ""))
+
+    if agent_name == "none":
+        return {"output": OUT_OF_SCOPE_RESPONSE, "tool_calls": []}
+    if agent_name == DIRECT_ANSWER_AGENT:
+        output = await run_direct_answer(routed_message)
+        return {"output": output, "tool_calls": []}
+
+    logger.info(f"Routed → {agent_name} | msg: {routed_message[:100]}")
+    try:
+        agent_result = await call_agent(agent_name, routed_message)
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Agent HTTP error: {e.response.status_code} {e.response.text}")
+        return {
+            "output": f"The {agent_name} agent encountered an error ({e.response.status_code}). Please try again.",
+            "tool_calls": [],
+        }
+    except httpx.ConnectError:
+        logger.error(f"Cannot connect to agent '{agent_name}'")
+        return {
+            "output": f"The {agent_name} agent is currently unavailable. Please try again later.",
+            "tool_calls": [],
+        }
+    except Exception:
+        logger.exception(f"Unexpected error calling agent '{agent_name}'")
+        return {"output": "An unexpected error occurred. Please try again.", "tool_calls": []}
+
+    return {
+        "output": str(agent_result.get("output", "")),
+        "tool_calls": agent_result.get("tool_calls", []),
+    }
+
+
+async def finalize_node(state: SupervisorState) -> SupervisorState:
+    output = state.get("output", "").strip()
+    if not output:
+        output = "I couldn't produce a response. Please try rephrasing your request."
+    return {"output": output}
+
+
+def _build_supervisor_graph():
+    graph = StateGraph(SupervisorState)
+    graph.add_node("reasoning", reasoning_node)
+    graph.add_node("route", routing_node)
+    graph.add_node("fallback", fallback_node)
+    graph.add_node("out_of_scope", out_of_scope_node)
+    graph.add_node("execute", execute_agent_node)
+    graph.add_node("finalize", finalize_node)
+
+    graph.add_edge(START, "reasoning")
+    graph.add_edge("reasoning", "route")
+    graph.add_conditional_edges(
+        "route",
+        post_routing_next,
+        {
+            "fallback": "fallback",
+            "out_of_scope": "out_of_scope",
+            "execute": "execute",
+        },
+    )
+    graph.add_edge("fallback", "execute")
+    graph.add_edge("execute", "finalize")
+    graph.add_edge("finalize", END)
+    graph.add_edge("out_of_scope", END)
+    return graph.compile()
+
+
+SUPERVISOR_GRAPH = _build_supervisor_graph()
+
+
+# ── Main supervisor entry points ──────────────────────────────────────────────
 
 async def run_supervisor(user_message: str) -> dict:
     """
@@ -214,49 +369,11 @@ async def run_supervisor(user_message: str) -> dict:
     """
     logger.info(f"Supervisor received: {user_message[:120]}")
 
-    # Step 1: Route
-    agent_name, routed_message, reason = await route_to_agent(user_message)
-
-    # Step 2: Handle out-of-scope
-    if agent_name == "none":
-        logger.info(f"Out-of-scope request. Reason: {reason}")
-        return {
-            "output": OUT_OF_SCOPE_RESPONSE,
-            "agent_used": "none",
-            "tool_calls": [],
-        }
-
-    logger.info(f"Routed → {agent_name} | msg: {routed_message[:100]}")
-
-    # Step 3: Call agent
-    try:
-        agent_result = await call_agent(agent_name, routed_message)
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Agent HTTP error: {e.response.status_code} {e.response.text}")
-        return {
-            "output": f"The {agent_name} agent encountered an error ({e.response.status_code}). Please try again.",
-            "agent_used": agent_name,
-            "tool_calls": [],
-        }
-    except httpx.ConnectError:
-        logger.error(f"Cannot connect to agent '{agent_name}'")
-        return {
-            "output": f"The {agent_name} agent is currently unavailable. Please try again later.",
-            "agent_used": agent_name,
-            "tool_calls": [],
-        }
-    except Exception as e:
-        logger.exception(f"Unexpected error calling agent '{agent_name}'")
-        return {
-            "output": "An unexpected error occurred. Please try again.",
-            "agent_used": agent_name,
-            "tool_calls": [],
-        }
-
+    final_state = await SUPERVISOR_GRAPH.ainvoke({"user_message": user_message})
     return {
-        "output": agent_result.get("output", ""),
-        "agent_used": agent_name,
-        "tool_calls": agent_result.get("tool_calls", []),
+        "output": str(final_state.get("output", "")),
+        "agent_used": str(final_state.get("selected_agent", "none")),
+        "tool_calls": final_state.get("tool_calls", []),
     }
 
 
@@ -277,7 +394,44 @@ async def run_supervisor_stream(user_message: str, session_id: str = "default", 
         "timestamp": _now_iso(),
     }
 
-    agent_name, routed_message, reason = await route_to_agent(user_message)
+    # Node: reasoning
+    reasoning_state = await reasoning_node({"user_message": user_message})
+    yield {
+        "event": "routing",
+        "data": {
+            "stage": "reasoning",
+            "reason": reasoning_state.get("routing_reason", ""),
+            "stream_id": stream_id,
+            "session_id": session_id,
+        },
+        "timestamp": _now_iso(),
+    }
+
+    # Node: route
+    route_state = await routing_node({**reasoning_state, "user_message": user_message})
+    agent_name = route_state.get("selected_agent", "none")
+    routed_message = route_state.get("routed_message", user_message)
+    reason = route_state.get("routing_reason", "")
+    route_status = route_state.get("route_status", "undetermined")
+
+    if route_status == "undetermined":
+        route_state = await fallback_node(route_state)
+        agent_name = route_state.get("selected_agent", DEFAULT_FALLBACK_AGENT)
+        reason = route_state.get("routing_reason", reason)
+        route_status = "selected"
+
+    yield {
+        "event": "routing",
+        "data": {
+            "agent": agent_name,
+            "reason": reason,
+            "route_status": route_status,
+            "stream_id": stream_id,
+            "session_id": session_id,
+        },
+        "timestamp": _now_iso(),
+    }
+
     yield {
         "event": "agent_started",
         "data": {
@@ -288,13 +442,30 @@ async def run_supervisor_stream(user_message: str, session_id: str = "default", 
         "timestamp": _now_iso(),
     }
 
-    if agent_name == "none":
+    if route_status == "out_of_scope" or agent_name == "none":
         yield {
             "event": "llm_final",
             "data": {"output": OUT_OF_SCOPE_RESPONSE, "stream_id": stream_id},
             "timestamp": _now_iso(),
         }
         return
+
+    if agent_name == DIRECT_ANSWER_AGENT:
+        try:
+            output = await run_direct_answer(routed_message)
+            yield {
+                "event": "llm_final",
+                "data": {"output": output, "stream_id": stream_id, "session_id": session_id},
+                "timestamp": _now_iso(),
+            }
+            return
+        except Exception as exc:
+            yield {
+                "event": "error",
+                "data": {"message": str(exc), "stream_id": stream_id, "session_id": session_id},
+                "timestamp": _now_iso(),
+            }
+            return
 
     try:
         async for evt in call_agent_stream(agent_name, routed_message):
