@@ -441,7 +441,3 @@ The GitHub Agent includes an automatic parameter resolver that fills in missing 
 
 ---
 
-## 📄 License
-
-MIT — see [LICENSE](LICENSE) for details.
-
