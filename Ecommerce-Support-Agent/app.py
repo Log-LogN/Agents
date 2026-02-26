@@ -565,11 +565,11 @@ def main() -> None:
         st.rerun()
 
     # ── Chat input ────────────────────────────────────────────────────
-    with chat_col:
-        user_input = st.chat_input(
-            "Ask anything… e.g. 'Where is my order?', "
-            "'I want to return an item', 'Check my loyalty points'"
-        )
+    # Moved OUTSIDE of chat_col to ensure it sticks to the bottom
+    user_input = st.chat_input(
+        "Ask anything… e.g. 'Where is my order?', "
+        "'I want to return an item', 'Check my loyalty points'"
+    )
 
     if user_input:
         with chat_col:
@@ -580,6 +580,7 @@ def main() -> None:
                     reply, trace = _run_turn(user_input)
                 st.write(reply)
                 _render_trace_in_chat(trace)
+        st.rerun()
 
 
 if __name__ == "__main__":
