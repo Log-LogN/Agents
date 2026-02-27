@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.eggs/
+.python-version
+.pytest_cache/
+
+# Virtual env
+.venv/
+venv/
+ENV/
+
+# Env files
+.env
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
+# Byte-compiled / caches
+*.pyc
+
+# macOS
+.AppleDouble
+.LSOverride
+
+# PyCharm
+.idea/
+
+# Misc
+coverage.xml
+htmlcov/
+
+# node
+node_modules/
+
+# Build
+dist/
+build/
+
+# Local test artifacts
+*.sqlite
+
+# Secrets
+secrets.json
+
+# Optional: ignore notebook checkpoints
+.ipynb_checkpoints/
+
+*.zip
