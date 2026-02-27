@@ -16,7 +16,7 @@ All coordinated by an intelligent **Supervisor Agent** with auto-chaining execut
 
 | Supervisor CLI   | MCP Services     | Streaming CLI           |
 | ---------------- | ---------------- | ----------------------- |
-| ![supervisor.png](docs/images/supervisor.png) | ![mcp.png](docs/images/mcp.png)| [cli.mov](docs/images/cli.mov) |
+| ![supervisor.png](docs/images/supervisor.png) | ![mcp.png](docs/images/mcp.png)| ![cli.gif](docs/images/cli.gif) |
 
 
 ---
