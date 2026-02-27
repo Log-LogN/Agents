@@ -11,6 +11,12 @@ This README provides:
 
 ---
 
+## HireSmart HR Hiring System Demo
+
+![alt text](assets/demo.gif)
+
+---
+
 ## 1. What This System Does
 
 HireSmart is a multi-agent HR system that supports:
@@ -69,6 +75,7 @@ Key files:
 - `app.py` -> Streamlit UI
 - `start_servers.py`-> launcher for all MCP servers
 - `supervisor/` -> supervisor graph and server
+- `supervisor/thread_memory.py` -> Redis memory management
 - `mcp_servers/` -> specialist MCP servers
 - `database/db.py` -> schema + seed data
 - `.env` -> configuration
@@ -80,24 +87,19 @@ Key files:
 ### 3.1 UI to Supervisor
 
 1. User types a message in the Streamlit UI (`app.py`).
-2. The UI builds a compact chat history and sends it as JSON-RPC to the Supervisor MCP endpoint:
+2. The UI sends the message along with a `thread_id` to the Supervisor MCP endpoint:
    - `http://127.0.0.1:9001/mcp`
 3. The Supervisor responds with:
    - `final_reply` (text to show the user)
    - `trace` (routing + tool calls)
 
-### 3.2 Supervisor Routing
+### 3.2 Supervisor Routing & Persistence
 
-1. The Supervisor uses a LangGraph state machine defined in `supervisor/graph.py`.
-2. A system prompt defines routing rules for 7 specialist domains.
-3. The supervisor LLM emits a tool call:
-   - `transfer_to_job`, `transfer_to_resume`, etc.
-4. The graph transitions into the correct specialist node.
-
-Fallback behavior:
-
-- If the LLM does not choose a clear route, the system tries keyword inference.
-- If still unclear, it routes to `default_answer_agent` which replies with a minimal guidance message.
+1. The Supervisor loads the session history from **Redis** using the `thread_id`.
+2. It uses a LangGraph state machine defined in `supervisor/graph.py`.
+3. A system prompt defines routing rules for 7 specialist domains.
+4. The supervisor LLM emits a tool call (e.g., `transfer_to_job`).
+5. After getting the result, the Supervisor updates the history in Redis, potentially compacting old turns into a summary.
 
 ### 3.3 Specialist MCP Servers
 
@@ -181,6 +183,19 @@ Update `.env` (use `.env.example` as template):
 - `OPENAI_API_KEY`
 - `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`
 - Email settings if needed
+- Redis memory settings (optional but recommended for multi-turn speed):
+  - `REDIS_ENABLED`, `REDIS_URL`
+  - `REDIS_THREAD_TEXT_LIMIT` (max chars before compaction)
+  - `REDIS_THREAD_KEEP_MESSAGES` (recent messages kept verbatim)
+  - `REDIS_THREAD_TTL_SEC` (thread expiration)
+  - `REDIS_SUMMARY_MODEL` (model used to summarize old thread turns)
+
+### Redis Thread Memory
+
+- Each chat session now sends a `thread_id` to the supervisor.
+- Supervisor stores per-thread request/response turns in Redis.
+- When thread text size crosses `REDIS_THREAD_TEXT_LIMIT`, older turns are compressed into a running summary and only recent turns are kept in full.
+- This reduces payload size and keeps multi-agent responses faster while preserving context.
 
 ### 6.2 Start All Servers
 
@@ -225,6 +240,7 @@ From `requirements.txt`:
 - nest-asyncio>=1.6.0
 - uvicorn>=0.30.0
 - httpx>=0.27.0
+- redis>=5.0.0
 
 ---
 

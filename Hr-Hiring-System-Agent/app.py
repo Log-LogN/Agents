@@ -26,7 +26,7 @@ Login Accounts
     hiring.manager@hrapp.com / hm123      → Hiring Manager
 """
 
-import json, sys, os
+import json, sys, os, uuid, re, hashlib
 import httpx
 import streamlit as st
 
@@ -204,7 +204,12 @@ def _compact_context(messages: list) -> list:
     return compact[-MAX_CONTEXT_MESSAGES:]
 
 
-def _call_supervisor(messages: list, user_role: str = "", user_email: str = "") -> dict:
+def _call_supervisor(
+    messages: list,
+    user_role: str = "",
+    user_email: str = "",
+    thread_id: str = "",
+) -> dict:
     """Send conversation history to Supervisor MCP on port 9001."""
     payload = {
         "jsonrpc": "2.0", "id": 1,
@@ -212,7 +217,8 @@ def _call_supervisor(messages: list, user_role: str = "", user_email: str = "") 
         "params": {
             "name": "chat",
             "arguments": {
-                "messages_json": json.dumps(messages)
+                "messages_json": json.dumps(messages),
+                "thread_id": thread_id,
             }
         }
     }
@@ -338,6 +344,80 @@ def _render_trace(trace: list) -> None:
                 f'<div class="tool-body">{text}</div></div>',
                 unsafe_allow_html=True,
             )
+
+
+def _extract_recommendations(content: str) -> tuple[str, list]:
+    """
+    Parse assistant content and extract trailing recommendation lines.
+    Supported headers: Recommendations, Suggested Next Prompts, Suggestions.
+    """
+    if not isinstance(content, str):
+        return str(content), []
+
+    lines = content.splitlines()
+    header_index = -1
+    for i, raw in enumerate(lines):
+        line = raw.strip().lower()
+        if line in (
+            "recommendations:",
+            "suggestions:",
+            "suggested next prompts:",
+            "recommended next prompts:",
+            "recommended prompts:",
+            "next steps:",
+        ):
+            header_index = i
+            break
+
+    if header_index == -1:
+        return content, []
+
+    body_lines = lines[header_index + 1 :]
+    recs = []
+    blocked_patterns = (
+        "provide id",
+        "provide",
+        "provide job id",
+        "provide candidate id",
+        "provide interview id",
+        "provide offer id",
+        "share id",
+        "give id",
+        "enter id",
+    )
+    for raw in body_lines:
+        line = raw.strip()
+        if not line:
+            continue
+        line = re.sub(r"^[-*]\s+", "", line)
+        line = re.sub(r"^\d+\.\s+", "", line)
+        line = re.sub(r"^\d+\)\s+", "", line)
+        lowered = line.lower()
+        if line and not any(p in lowered for p in blocked_patterns):
+            recs.append(line)
+
+    main = "\n".join(lines[:header_index]).strip()
+    if not recs:
+        return content, []
+    return main, recs[:2]
+
+
+def _render_ai_message(content: str, key_prefix: str) -> None:
+    main_text, recs = _extract_recommendations(content)
+    if main_text:
+        st.write(main_text)
+
+    if not recs:
+        return
+
+    st.markdown("**Recommendations**")
+    for idx, rec in enumerate(recs):
+        safe_key = hashlib.md5(f"{key_prefix}:{idx}:{rec}".encode("utf-8")).hexdigest()[:12]
+        if st.button(f"→ {rec}", key=f"rec_{safe_key}", use_container_width=True):
+            st.session_state.pending_msg = rec
+            st.rerun()
+
+
 def _run_turn(user_text: str) -> tuple[str, list]:
     st.session_state.messages.append({"role": "human", "content": user_text})
     context_messages = _compact_context(st.session_state.messages)
@@ -345,6 +425,7 @@ def _run_turn(user_text: str) -> tuple[str, list]:
         context_messages,
         st.session_state.user["role"],
         st.session_state.user["email"],
+        st.session_state.thread_id,
     )
 
     final_reply = (result.get("final_reply") or "").strip()
@@ -386,6 +467,7 @@ def _show_login() -> None:
                 if user:
                     st.session_state.user      = user
                     st.session_state.messages  = []
+                    st.session_state.thread_id = uuid.uuid4().hex
                     st.rerun()
                 else:
                     st.error("[ERROR] Invalid email or password.")
@@ -477,9 +559,10 @@ def _sidebar(user: dict) -> None:
         st.markdown("---")
         if st.button("🗑️ Clear Chat", key="clear_chat"):
             st.session_state.messages  = []
+            st.session_state.thread_id = uuid.uuid4().hex
             st.rerun()
         if st.button("🚪 Logout", key="logout"):
-            for k in ["user","messages","pending_msg","selected_agent"]:
+            for k in ["user","messages","pending_msg","selected_agent","thread_id"]:
                 st.session_state.pop(k, None)
             st.rerun()
         st.caption(f"Supervisor :9001 → Agents :8001–8007")
@@ -555,6 +638,8 @@ def main() -> None:
     # Session state
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "thread_id" not in st.session_state:
+        st.session_state.thread_id = uuid.uuid4().hex
     # Sidebar
     _sidebar(user)
     # Header
@@ -569,7 +654,7 @@ def main() -> None:
     if not st.session_state.messages:
         _welcome_cards(role)
     # Chat history with trace dropdown per assistant message
-    for msg in st.session_state.messages:
+    for msg_idx, msg in enumerate(st.session_state.messages):
         role_msg = msg.get("role", "human") if isinstance(msg, dict) else "human"
         content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
         if role_msg == "human":
@@ -577,7 +662,7 @@ def main() -> None:
                 st.write(content)
         elif role_msg == "ai" and content and not msg.get("tool_calls"):
             with st.chat_message("assistant"):
-                st.write(content)
+                _render_ai_message(content, key_prefix=f"hist_{msg_idx}")
                 with st.expander("Live Supervisor Routing Trace", expanded=False):
                     _render_trace(msg.get("trace", []))
     # Quick action handler
@@ -588,7 +673,7 @@ def main() -> None:
         with st.chat_message("assistant"):
             with st.spinner("Supervisor routing to specialist agent..."):
                 reply, trace = _run_turn(user_input)
-            st.write(reply)
+            _render_ai_message(reply, key_prefix=f"live_qa_{uuid.uuid4().hex}")
             with st.expander("Live Supervisor Routing Trace", expanded=False):
                 _render_trace(trace)
         st.rerun()
@@ -601,7 +686,7 @@ def main() -> None:
         with st.chat_message("assistant"):
             with st.spinner("Routing to best specialist agent..."):
                 reply, trace = _run_turn(user_input)
-            st.write(reply)
+            _render_ai_message(reply, key_prefix=f"live_chat_{uuid.uuid4().hex}")
             with st.expander("Live Supervisor Routing Trace", expanded=False):
                 _render_trace(trace)
 if __name__ == "__main__":

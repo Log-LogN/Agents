@@ -16,9 +16,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import nest_asyncio
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from mcp.server.fastmcp import FastMCP
 from supervisor.graph import SPECIALIST_SERVERS, build_graph, serialise_messages, build_trace
+from supervisor.thread_memory import RedisThreadMemory
 
 nest_asyncio.apply()
 load_dotenv()
@@ -44,6 +46,9 @@ _OPENAI_CONNECT_ERROR = ""
 GRAPH_BUILD_TIMEOUT_SEC = float(os.getenv("GRAPH_BUILD_TIMEOUT_SEC", "45"))
 GRAPH_INVOKE_TIMEOUT_SEC = float(os.getenv("GRAPH_INVOKE_TIMEOUT_SEC", "95"))
 SPECIALIST_PING_TIMEOUT_SEC = float(os.getenv("SPECIALIST_PING_TIMEOUT_SEC", "0.7"))
+MEMORY_SUMMARY_MAX_ITEMS = int(os.getenv("REDIS_SUMMARY_INPUT_MAX_ITEMS", "24"))
+
+_THREAD_MEMORY = RedisThreadMemory()
 
 
 def _ensure_openai_reachable(timeout_sec: float = 2.5) -> bool:
@@ -248,8 +253,52 @@ def _decode_messages(raw: list) -> list:
     return lc
 
 
+def _latest_human_text(raw: list) -> str:
+    for m in reversed(raw):
+        if isinstance(m, dict) and m.get("role") == "human":
+            return (m.get("content") or "").strip()
+    return ""
+
+
+def _summarize_with_llm(existing_summary: str, old_messages: list) -> str:
+    if not old_messages:
+        return existing_summary or ""
+
+    trimmed = old_messages[-MEMORY_SUMMARY_MAX_ITEMS:]
+    lines = []
+    for item in trimmed:
+        role = "User" if item.get("role") == "human" else "Assistant"
+        text = str(item.get("content", "")).strip().replace("\n", " ")
+        if len(text) > 240:
+            text = text[:240] + "..."
+        if text:
+            lines.append(f"{role}: {text}")
+
+    if not lines:
+        return existing_summary or ""
+
+    summarizer = ChatOpenAI(
+        model=os.getenv("REDIS_SUMMARY_MODEL", "gpt-4o-mini"),
+        temperature=0,
+        api_key=os.getenv("OPENAI_API_KEY"),
+        timeout=20,
+        max_retries=1,
+    )
+    prompt = (
+        "You are compressing ongoing chat memory for an HR multi-agent system.\n"
+        "Keep key facts, IDs, decisions, constraints, and pending tasks.\n"
+        "Use concise bullet points.\n\n"
+        f"Existing summary:\n{existing_summary or '(none)'}\n\n"
+        "New turns to compress:\n"
+        + "\n".join(lines)
+    )
+    result = summarizer.invoke(prompt)
+    text = getattr(result, "content", "") or ""
+    return text.strip() or (existing_summary or "")
+
+
 @mcp.tool()
-def chat(messages_json: str) -> str:
+def chat(messages_json: str, thread_id: str = "") -> str:
     """Primary entry-point for the HR Hiring Supervisor MCP Server."""
     try:
         raw = json.loads(messages_json)
@@ -257,7 +306,7 @@ def chat(messages_json: str) -> str:
         return json.dumps({"error": str(e), "final_reply": "[ERROR] Invalid message format.", "trace": []})
 
     request_start = time.perf_counter()
-    log.info("chat() - %d message(s)", len(raw))
+    log.info("chat() - %d message(s) thread=%s", len(raw), thread_id or "-")
 
     down = _unreachable_specialists()
     if down:
@@ -266,7 +315,28 @@ def chat(messages_json: str) -> str:
     if not _ensure_openai_reachable():
         return _offline_response(raw)
 
+    loaded_summary = ""
+    if thread_id and _THREAD_MEMORY.enabled:
+        mem = _THREAD_MEMORY.load(thread_id)
+        loaded_summary = mem.get("summary", "") or ""
+        mem_messages = mem.get("messages", []) or []
+        current_human = _latest_human_text(raw)
+        if current_human:
+            raw = mem_messages + [{"role": "human", "content": current_human}]
+        else:
+            raw = mem_messages
+
     lc_messages = _decode_messages(raw)
+    if loaded_summary:
+        lc_messages = [
+            SystemMessage(
+                content=(
+                    "Thread memory summary from earlier conversation. "
+                    "Use as context and prioritize explicit latest user input.\n"
+                    f"{loaded_summary}"
+                )
+            )
+        ] + lc_messages
 
     try:
         global _CACHED_GRAPH
@@ -312,6 +382,16 @@ def chat(messages_json: str) -> str:
     history = serialise_messages(msgs)
     elapsed = time.perf_counter() - request_start
     log.info("chat() latency: %.2fs", elapsed)
+
+    if thread_id and _THREAD_MEMORY.enabled:
+        user_text = _latest_human_text(raw)
+        if user_text:
+            _THREAD_MEMORY.append_turn(
+                thread_id=thread_id,
+                request_text=user_text,
+                response_text=final,
+                summarizer=_summarize_with_llm if _ensure_openai_reachable() else None,
+            )
 
     return json.dumps({"final_reply": final, "trace": trace, "messages": history})
 

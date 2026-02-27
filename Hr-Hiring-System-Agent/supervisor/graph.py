@@ -126,6 +126,15 @@ Rules:
 
 
 # ── Version-safe create_react_agent ──────────────────────────────────────────
+RECOMMENDATIONS_FORMAT_PROMPT = """
+Response format requirement (always apply):
+- End every final user-facing response with a section header exactly: Recommendations:
+- Under it, include exactly 2 short, clickable next-prompt suggestions.
+- Each suggestion must be a single line and directly usable as the user's next message.
+- Do not ask users to provide IDs or missing inputs (avoid phrases like "provide id", "provide job id", "share candidate id").
+- Suggestions must be fully actionable and user-friendly.
+"""
+
 _PROMPT_KEY = (
     "state_modifier"
     if "state_modifier" in _inspect.signature(create_react_agent).parameters
@@ -133,7 +142,8 @@ _PROMPT_KEY = (
 )
 
 def _make_agent(llm, tools, prompt: str):
-    return create_react_agent(llm, tools, **{_PROMPT_KEY: prompt})
+    full_prompt = prompt + "\n\n" + RECOMMENDATIONS_FORMAT_PROMPT
+    return create_react_agent(llm, tools, **{_PROMPT_KEY: full_prompt})
 
 
 # ── LangGraph state ───────────────────────────────────────────────────────────
@@ -349,7 +359,10 @@ async def build_graph():
                     content=(
                         "I could not determine the right specialist for this request. "
                         "Please rephrase in one line and mention one area: jobs, resumes/candidates, "
-                        "interviews, offers, onboarding, communications, or analytics."
+                        "interviews, offers, onboarding, communications, or analytics.\n\n"
+                        "Recommendations:\n"
+                        "- List all open job postings\n"
+                        "- Show upcoming interviews for the next 7 days"
                     )
                 )
             ]
