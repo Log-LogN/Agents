@@ -132,9 +132,7 @@ async def reasoning_node(state: SupervisorState) -> SupervisorState:
     # Get the last human message
     last_message = state["messages"][-1]
     user_message = last_message.content if hasattr(last_message, 'content') else str(last_message)
-    # Prepend system prompt for LLM-based intent detection
-    prompt = SUPERVISOR_SYSTEM_PROMPT + "\n" + user_message
-    match = detect_intent(prompt)
+    match = detect_intent(user_message)
     logger.info("Intent %s", match.intent)
     return {"intent": match.intent, "selected_agent": match.intent}
 
@@ -289,34 +287,3 @@ async def run_supervisor(user_message: str, session_id: str, graph):
         "agent_used": final.get("intent", final.get("selected_agent", "")),
         "tool_calls": final.get("tool_calls", []),
     }
-
-
-# =========================================================
-# Supervisor System Prompt
-# =========================================================
-
-SUPERVISOR_SYSTEM_PROMPT = (
-    """
-You are a cybersecurity multi-agent supervisor.
-
-You have access to the following specialized agents and tools:
-- Recon Agent: For network, DNS, port, and domain reconnaissance.
-- Vulnerability Agent: For package, dependency, and CVE vulnerability analysis.
-- Threat Intel Agent: For threat intelligence lookups.
-- Risk Agent: For risk scoring and risk summaries.
-- Reporting Agent: For generating security reports.
-- Advisory Agent: For security advisories and recommendations.
-- Dependency Agent: For scanning and analyzing project dependencies.
-
-Tool selection rules:
-- If the user asks for a port scan, DNS lookup, or domain info, use the Recon Agent.
-- If the user asks about vulnerabilities, CVEs, or package security, use the Vulnerability Agent.
-- If the user asks about threat intelligence, use the Threat Intel Agent.
-- If the user asks for a risk score or summary, use the Risk Agent.
-- If the user asks for a report, use the Reporting Agent.
-- If the user asks for security advisories, use the Advisory Agent.
-- If the user asks to scan dependencies, use the Dependency Agent.
-
-Always select the most relevant agent/tool for the user's request. Never invent results; always use tool outputs.
-"""
-)
