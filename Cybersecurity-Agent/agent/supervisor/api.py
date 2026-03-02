@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 import json
 
 from .graph import build_supervisor_graph, run_supervisor
-from .mcp_client import get_mcp_tools
+from .mcp_client import get_mcp_tools, get_all_mcp_tools
 from shared.models import ChatRequest, ChatResponse, generate_session_id, RedisSessionStore
 
 
@@ -17,10 +17,12 @@ SUPERVISOR_GRAPH = build_supervisor_graph()
 @app.on_event("startup")
 async def startup():
     recon_tools, vuln_tools = await get_mcp_tools()
+    all_tools = await get_all_mcp_tools()
 
     print("\nSupervisor loaded tools")
     print("Recon:", [t.name for t in recon_tools])
     print("Vulnerability:", [t.name for t in vuln_tools])
+    print("All MCP tools:", [t.name for t in all_tools])
     print()
 
 

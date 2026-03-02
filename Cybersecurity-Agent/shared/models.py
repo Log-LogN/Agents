@@ -4,6 +4,7 @@ import uuid
 from shared.config import settings
 import redis
 import json
+import time
 
 
 # ── Inbound requests ────────────────────────────────────────────────────────
@@ -78,15 +79,52 @@ class RedisSessionStore:
 
     def get_session_history(self, session_id: str) -> List[Dict[str, Any]]:
         """Retrieve conversation history for a session."""
-        history_json = self.redis.get(f"session:{session_id}:history")
-        if history_json:
-            return json.loads(history_json)
-        return []
+        try:
+            history_json = self.redis.get(f"session:{session_id}:history")
+            if history_json:
+                return json.loads(history_json)
+            return []
+        except Exception:
+            return []
 
     def save_session_history(self, session_id: str, history: List[Dict[str, Any]]):
         """Save conversation history for a session."""
-        self.redis.set(f"session:{session_id}:history", json.dumps(history))
+        try:
+            self.redis.set(f"session:{session_id}:history", json.dumps(history))
+        except Exception:
+            return
+
+    def get_session_artifacts(self, session_id: str) -> List[Dict[str, Any]]:
+        """
+        Retrieve structured artifacts for a session (tool calls, findings, risk summaries).
+        """
+        try:
+            artifacts_json = self.redis.get(f"session:{session_id}:artifacts")
+            if artifacts_json:
+                return json.loads(artifacts_json)
+            return []
+        except Exception:
+            return []
+
+    def append_session_artifact(self, session_id: str, artifact: Dict[str, Any]):
+        """
+        Append a structured artifact entry to a session.
+        """
+        try:
+            artifacts = self.get_session_artifacts(session_id)
+            entry = dict(artifact)
+            # Blueprint-compatible timestamp key.
+            if "timestamp" not in entry:
+                entry["timestamp"] = int(time.time())
+            artifacts.append(entry)
+            self.redis.set(f"session:{session_id}:artifacts", json.dumps(artifacts))
+        except Exception:
+            return
 
     def delete_session(self, session_id: str):
         """Delete a session and its data."""
-        self.redis.delete(f"session:{session_id}:history")
+        try:
+            self.redis.delete(f"session:{session_id}:history")
+            self.redis.delete(f"session:{session_id}:artifacts")
+        except Exception:
+            return

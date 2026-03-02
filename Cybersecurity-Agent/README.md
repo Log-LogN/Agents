@@ -7,6 +7,8 @@ A comprehensive AI-powered cybersecurity analysis platform built with LangGraph,
 ### Core Capabilities
 - **Intelligent Agent Routing**: Automatically routes queries to appropriate specialized agents
 - **Vulnerability Analysis**: Comprehensive CVE and package vulnerability scanning
+- **Threat Intelligence**: EPSS lookup, exploit availability signal, and CISA KEV checks
+- **Risk Prioritization**: Deterministic unified scoring (0–10) with severity + reasons
 - **Reconnaissance**: DNS lookup, port scanning, and WHOIS analysis
 - **Conversation Memory**: Redis-backed session persistence for multi-turn conversations
 - **Streaming Responses**: Real-time updates via Server-Sent Events
@@ -16,6 +18,8 @@ A comprehensive AI-powered cybersecurity analysis platform built with LangGraph,
 - **Supervisor Agent**: Routes requests and manages conversation flow
 - **Vulnerability Agent**: Analyzes software packages and CVEs
 - **Recon Agent**: Performs network reconnaissance
+- **Risk Assessment**: Combines CVSS + threat intel + exposure to answer “should I patch now?”
+- **Reporting**: Generates Phase-1 session report (Markdown)
 - **Direct Answer Agent**: Handles general cybersecurity questions
 
 ## 🏗️ Architecture
@@ -27,6 +31,8 @@ A comprehensive AI-powered cybersecurity analysis platform built with LangGraph,
 │ - Session Mgmt  │◄──►│ - /chat         │◄──►│ - Recon (8001)  │
 │ - Chat Interface│    │ - /chat/stream  │    │ - Vuln (8003)   │
 │ - History       │    │ - /chat/history │    │ - Reporting (8002)
+│                 │    │                 │    │ - Threat Intel (8004)
+│                 │    │                 │    │ - Risk Engine (8005)
 └─────────────────┘    └─────────────────┘    └─────────────────┘
                               │
                               ▼
@@ -70,6 +76,10 @@ A comprehensive AI-powered cybersecurity analysis platform built with LangGraph,
    REDIS_PORT=6379
    REDIS_DB=0
    LOG_LEVEL=INFO
+   # Optional (improves GitHub exploit signal reliability)
+   GITHUB_TOKEN=your_github_token
+   # Optional (default 6h)
+   CISA_KEV_CACHE_TTL_SECONDS=21600
    ```
 
 3. **Start Redis**:
@@ -84,6 +94,7 @@ A comprehensive AI-powered cybersecurity analysis platform built with LangGraph,
 python mcp_launcher.py
 ```
 This starts the tool servers on ports 8001-8003.
+Phase-1 also starts Threat Intel (8004) and Risk Engine (8005).
 
 ### 2. Start Supervisor API
 ```bash
@@ -145,6 +156,9 @@ UI available at `http://localhost:8501`.
 ### Example Queries
 - `"Check vulnerabilities for next@15.0.8"`
 - `"Scan ports on example.com"`
+- `"Analyze risk for CVE-2024-12345 on example.com"`
+- `"Is CVE-2024-12345 exploited?"`
+- `"Generate a session report"`
 - `"What is DNS?"`
 - `"Analyze CVE-2023-12345"`
 

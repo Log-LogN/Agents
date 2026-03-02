@@ -6,6 +6,8 @@ SERVERS = [
     ("mcp_tools.recon.server:create_app", 8001),
     ("mcp_tools.reporting.server:create_app", 8002),
     ("mcp_tools.vulnerability.server:create_app", 8003),
+    ("mcp_tools.threat_intel.server:create_app", 8004),
+    ("mcp_tools.risk_engine.server:create_app", 8005),
 ]
 
 

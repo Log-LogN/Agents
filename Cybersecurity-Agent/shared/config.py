@@ -28,4 +28,8 @@ class Settings:
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
     REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
 
+    # ── Threat Intel Integrations ───────────────────────────
+    GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
+    CISA_KEV_CACHE_TTL_SECONDS: int = int(os.getenv("CISA_KEV_CACHE_TTL_SECONDS", str(6 * 60 * 60)))
+
 settings = Settings()

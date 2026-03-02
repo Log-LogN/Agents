@@ -7,6 +7,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp_tools.recon.tools.dns_lookup import dns_lookup
 from mcp_tools.recon.tools.port_scan import port_scan
 from mcp_tools.recon.tools.whois_lookup import whois_lookup
+from shared.models import HealthResponse
 
 mcp = FastMCP("recon-mcp")
 
@@ -30,4 +31,17 @@ def tool_whois_lookup(domain: str):
 
 
 def create_app():
-    return mcp.sse_app()
+    from fastapi import FastAPI
+
+    # Create a FastAPI app and mount the MCP SSE app
+    app = FastAPI()
+    sse_app = mcp.sse_app()
+
+    # Mount the SSE app at the root path
+    app.mount("/", sse_app)
+
+    @app.get("/health", response_model=HealthResponse)
+    async def health():
+        return HealthResponse(service="recon-mcp")
+
+    return app
