@@ -33,6 +33,15 @@ def port_scan(host: str) -> dict:
 
         open_ports = [p for p in results if p]
 
+        warning = None
+        # If EVERYTHING looks open, the result is almost certainly a captive portal,
+        # transparent proxy, or local network interception. Avoid reporting nonsense.
+        if open_ports and len(open_ports) == len(COMMON_PORTS):
+            warning = (
+                "All scanned ports appeared open. This is likely a false-positive due to network interception "
+                "(captive portal/transparent proxy) or an unexpected routing environment. Treat results as unreliable."
+            )
+
         return {
             "status": "success",
             "data": {
@@ -40,7 +49,8 @@ def port_scan(host: str) -> dict:
                 "ip": ip,
                 "open_ports": open_ports,
                 "open_count": len(open_ports),
-                "scanned_ports": COMMON_PORTS
+                "scanned_ports": COMMON_PORTS,
+                "warning": warning,
             },
             "error": None
         }

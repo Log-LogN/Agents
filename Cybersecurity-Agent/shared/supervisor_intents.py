@@ -6,6 +6,7 @@ from dataclasses import dataclass
 INTENTS = {
     "risk_assessment",
     "threat_only",
+    "advisory_explain",
     "session_analysis",
     "report_generation",
     "domain_assessment",
@@ -43,6 +44,18 @@ def extract_github_repo_url(text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def extract_advisory_id(text: str) -> str | None:
+    if not text:
+        return None
+    m = re.search(r"\bGHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}\b", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(0).upper()
+    m = re.search(r"\bCVE-\d{4}-\d{4,7}\b", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(0).upper()
+    return None
+
+
 @dataclass(frozen=True)
 class IntentMatch:
     intent: str
@@ -66,6 +79,10 @@ def detect_intent(message: str) -> IntentMatch:
     # report_generation
     if "generate report" in msg:
         return IntentMatch("report_generation", cve=cve, domain=domain)
+
+    # advisory_explain (strictly tool-driven; avoids hallucinated summaries)
+    if extract_advisory_id(message) and any(k in msg for k in ("explain", "details", "what is", "tell me about")):
+        return IntentMatch("advisory_explain", cve=cve, domain=domain)
 
     # dependency_scan (include common typos like "dependecy")
     repo = extract_github_repo_url(message)
@@ -106,6 +123,10 @@ def detect_intent(message: str) -> IntentMatch:
     if any(k in msg for k in ("actively exploited", "exploit available", "is this exploited")):
         return IntentMatch("threat_only", cve=cve, domain=domain)
 
+    # IP lookup for a domain should be deterministic and tool-driven.
+    if domain and any(k in msg for k in ("public ip", "ip address", "what is the ip", "resolve ip", "a record")):
+        return IntentMatch("domain_assessment", cve=None, domain=domain)
+
     # risk_assessment
     if any(k in msg for k in ("analyze risk", "risk for cve", "affected by")):
         return IntentMatch("risk_assessment", cve=cve, domain=domain)
@@ -118,7 +139,22 @@ def detect_intent(message: str) -> IntentMatch:
         return IntentMatch("domain_assessment", cve=None, domain=domain)
 
     # recon_only (basic)
-    if any(k in msg for k in ("scan ports", "port scan", "dns", "whois", "recon")):
+    if any(
+        k in msg
+        for k in (
+            "scan ports",
+            "port scan",
+            "dns",
+            "whois",
+            "recon",
+            "public ip",
+            "ip address",
+            "what is the ip",
+            "resolve ip",
+            "resolve",
+            "a record",
+        )
+    ):
         return IntentMatch("recon_only", cve=cve, domain=domain)
 
     return IntentMatch("direct_answer", cve=cve, domain=domain)

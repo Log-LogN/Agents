@@ -27,11 +27,31 @@ def ssl_info(host: str, port: int = 443) -> dict[str, Any]:
 
     try:
         ctx = ssl.create_default_context()
-        with socket.create_connection((host, port), timeout=8.0) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-                cert = ssock.getpeercert()
-                proto = ssock.version()
-                cipher = ssock.cipher()
+
+        # Try all resolved addresses (IPv4/IPv6) to avoid false failures.
+        addrinfos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        last_err: str | None = None
+
+        cert = None
+        proto = None
+        cipher = None
+
+        for family, socktype, proto_num, _canonname, sockaddr in addrinfos:
+            try:
+                with socket.socket(family, socktype, proto_num) as raw:
+                    raw.settimeout(8.0)
+                    raw.connect(sockaddr)
+                    with ctx.wrap_socket(raw, server_hostname=host) as ssock:
+                        cert = ssock.getpeercert()
+                        proto = ssock.version()
+                        cipher = ssock.cipher()
+                        break
+            except Exception as e:
+                last_err = str(e)
+                continue
+
+        if cert is None:
+            return {"status": "error", "data": None, "error": last_err or "TLS connection failed"}
 
         not_after = cert.get("notAfter")
         not_after_ts = _parse_notafter(not_after)
@@ -56,4 +76,3 @@ def ssl_info(host: str, port: int = 443) -> dict[str, Any]:
         }
     except Exception as e:
         return {"status": "error", "data": None, "error": str(e)}
-

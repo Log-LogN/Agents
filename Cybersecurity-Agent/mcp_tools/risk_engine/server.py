@@ -9,6 +9,7 @@ from mcp.server.fastmcp import FastMCP
 
 from shared.models import HealthResponse
 from mcp_tools.risk_engine.tools import calculate_risk
+from shared.request_context import install_request_context, get_session_id, get_request_id
 
 logger = logging.getLogger("risk-engine-mcp")
 
@@ -27,6 +28,7 @@ def tool_calculate_risk(
     """
     Calculate unified risk score (0-10) and severity.
     """
+    logger.info("tool_call tool_calculate_risk session_id=%s request_id=%s", get_session_id() or "-", get_request_id() or "-")
     return calculate_risk(
         cvss=cvss,
         epss=epss,
@@ -49,5 +51,5 @@ def create_app() -> FastAPI:
     async def health():
         return HealthResponse(service="risk-engine-mcp")
 
+    install_request_context(app, service_name="risk-engine-mcp", logger=logger)
     return app
-

@@ -117,6 +117,42 @@ UI available at `http://localhost:8501`.
 - `POST /chat/stream` - Server-Sent Events streaming
 - `GET /chat/history/{session_id}` - Retrieve conversation history
 
+## ✅ Phase‑1 Manual Test Matrix (Inputs → Tools → Expected Output)
+
+All tests below use the Supervisor endpoint:
+
+```bash
+curl -s http://localhost:9000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message":"<MESSAGE>","session_id":"test1"}'
+```
+
+### Supervisor Flows (Deterministic)
+
+| Flow / Intent | Sample `message` | MCP tools used | Expected output shape |
+|---|---|---|---|
+| Domain assessment (`domain_assessment`) | `Any vulnerability for loglogn.com` | `tool_dns_lookup`, `tool_whois_lookup`, `tool_port_scan`, `tool_http_security_headers`, `tool_ssl_info` | `Domain Assessment: <domain>` + Findings list (ports/headers/tls) |
+| Recon only (`recon_only`) | `Scan ports on loglogn.com` | `tool_port_scan` (and possibly `tool_dns_lookup` depending on query) | Summary mentioning open ports (limited common-port scan) |
+| Threat only (`threat_only`) | `Is CVE-2021-44228 actively exploited?` | `tool_get_epss`, `tool_check_cisa_kev`, `tool_check_exploit_available` | `Threat Status: <LOW|MEDIUM|HIGH>` + EPSS/KEV/exploit fields |
+| Risk assessment (`risk_assessment`) | `Analyze risk for CVE-2021-44228 on loglogn.com` | `tool_get_cvss`, `tool_get_epss`, `tool_check_cisa_kev`, `tool_check_exploit_available`, `tool_port_scan`, `tool_calculate_risk` | `Risk: <SEVERITY> (<score>)` + CVE/domain + reasons + `Action:` |
+| Session analysis (`session_analysis`) | `Which vulnerability should we fix first?` | (Redis only; no MCP tools) | `Highest Risk Issue` + CVE/domain + risk score |
+| Report generation (`report_generation`) | `Generate report` | `tool_generate_session_report` | `Session report generated: reports/<session_id>.md` |
+| Dependency scan (`dependency_scan`) | `scan dependecy for https://github.com/moeru-ai/airi` | `tool_scan_public_repo` | `Dependency Scan` + files scanned + deps parsed + vuln deps + findings list |
+
+### MCP Service Health Checks
+
+```bash
+curl -s http://localhost:8001/health
+curl -s http://localhost:8002/health
+curl -s http://localhost:8003/health
+curl -s http://localhost:8004/health
+curl -s http://localhost:8005/health
+curl -s http://localhost:8006/health
+```
+
+### Notes
+- Some MCP tools are **not** directly exposed by a Supervisor intent (e.g. `tool_risk_score`, `tool_severity_summary`, `tool_mitigation_advice`). If you want, we can add a deterministic Supervisor intent for each so every tool can be tested via `/chat`.
+
 ### Request Format
 ```json
 {
