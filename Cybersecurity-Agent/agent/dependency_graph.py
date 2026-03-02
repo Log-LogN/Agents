@@ -27,18 +27,28 @@ async def run_dependency_agent(message: str) -> dict:
 
     total_deps = 0
     total_vuln_deps = 0
-    top: list[str] = []
-
+    table_rows = []
     for r in results:
         scan = r.get("scan") or {}
         scan_data = (scan.get("data") or {}) if isinstance(scan, dict) else {}
         deps = scan_data.get("dependencies") or []
         total_deps += len(deps)
         for d in deps:
-            if (d.get("vulnerability_count") or 0) > 0:
+            vuln_count = d.get("vulnerability_count") or 0
+            if vuln_count > 0:
                 total_vuln_deps += 1
-                ids = [v.get("id") for v in (d.get("vulnerabilities") or []) if isinstance(v, dict) and v.get("id")]
-                top.append(f"{d.get('name')} ({d.get('ecosystem')}): {len(ids)} vuln(s) ({', '.join(ids[:3])})")
+            advisories = [v.get("id") for v in (d.get("vulnerabilities") or []) if isinstance(v, dict) and v.get("id")]
+            # Ensure all values are strings and None is replaced with "-"
+            def safe(val):
+                return str(val) if val is not None else "-"
+            table_rows.append([
+                safe(d.get("name")),
+                safe(d.get("ecosystem")),
+                safe(d.get("current_version")),
+                safe(d.get("latest_version")),
+                safe(vuln_count),
+                ", ".join(advisories[:3]) if advisories else "-"
+            ])
 
     lines = [
         "Dependency Scan",
@@ -47,10 +57,11 @@ async def run_dependency_agent(message: str) -> dict:
         f"Dependencies parsed: {total_deps}",
         f"Dependencies with vulnerabilities: {total_vuln_deps}",
     ]
-    if top:
-        lines.append("Findings:")
-        lines.extend([f"- {t}" for t in top[:10]])
+    if table_rows:
+        lines.append("\n| Name | Ecosystem | Current Version | Latest Version | Vuln Count | Top Advisories |")
+        lines.append("|------|-----------|----------------|---------------|------------|----------------|")
+        for row in table_rows:
+            lines.append(f"| {' | '.join(row)} |")
 
     artifact = {"type": "dependency_scan", "repo_url": repo_url, "result": data}
     return {"output": "\n".join(lines), "tool_calls": tool_calls, "artifact": artifact}
-

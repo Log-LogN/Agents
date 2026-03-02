@@ -131,6 +131,47 @@ def _parse_pom_xml(content: str) -> list[dict]:
     return deps
 
 
+def _parse_build_gradle(content: str) -> list[dict]:
+    deps: list[dict] = []
+    # Simple regex for implementation 'group:artifact:version' or "group:artifact:version"
+    pattern = re.compile(r"[ \t]*(implementation|api|compile|testImplementation|runtimeOnly)[ \t]+['\"]([\w.-]+):([\w.-]+):([\w.-]+)['\"]")
+    for match in pattern.finditer(content or ""):
+        group, artifact, version = match.group(2), match.group(3), match.group(4)
+        deps.append({
+            "name": f"{group}:{artifact}",
+            "group": group,
+            "artifact": artifact,
+            "version": version,
+            "pinned": True,
+            "ecosystem": "Gradle",
+        })
+    return deps
+
+
+def _parse_pubspec_yaml(content: str) -> list[dict]:
+    deps: list[dict] = []
+    in_deps = False
+    for line in (content or "").splitlines():
+        if line.strip().startswith("dependencies:"):
+            in_deps = True
+            continue
+        if in_deps:
+            if not line.strip() or line.startswith(" "):
+                m = re.match(r"^\s*([\w_\-]+):\s*([\w.-]+)?", line)  # removed redundant escape
+                if m:
+                    name = m.group(1)
+                    version = m.group(2) if m.group(2) else None
+                    deps.append({
+                        "name": name,
+                        "version": version,
+                        "pinned": bool(version),
+                        "ecosystem": "Pub",
+                    })
+            else:
+                break
+    return deps
+
+
 async def _osv_query(ecosystem: str, name: str, version: str) -> dict:
     url = "https://api.osv.dev/v1/query"
     payload = {"package": {"name": name, "ecosystem": ecosystem}, "version": version}
@@ -199,15 +240,19 @@ async def _latest_maven(group: str, artifact: str) -> str | None:
 
 async def scan_dependencies_from_text(content: str, file_type: str) -> dict:
     ft = (file_type or "").strip().lower()
-    if ft not in ("requirements.txt", "package.json", "pom.xml"):
-        return _failure("file_type must be requirements.txt, package.json, or pom.xml")
+    if ft not in ("requirements.txt", "package.json", "pom.xml", "build.gradle", "pubspec.yaml"):
+        return _failure("file_type must be requirements.txt, package.json, pom.xml, build.gradle, or pubspec.yaml")
 
     if ft == "requirements.txt":
         deps = _parse_requirements_txt(content)
     elif ft == "package.json":
         deps = _parse_package_json(content)
-    else:
+    elif ft == "pom.xml":
         deps = _parse_pom_xml(content)
+    elif ft == "build.gradle":
+        deps = _parse_build_gradle(content)
+    else:
+        deps = _parse_pubspec_yaml(content)
     if not deps:
         return _success({"file_type": ft, "count": 0, "dependencies": []})
 
@@ -222,8 +267,12 @@ async def scan_dependencies_from_text(content: str, file_type: str) -> dict:
             ecosystem = "PyPI"
         elif ft == "package.json":
             ecosystem = "npm"
-        else:
+        elif ft == "pom.xml":
             ecosystem = "Maven"
+        elif ft == "build.gradle":
+            ecosystem = "Gradle"
+        else:
+            ecosystem = "Pub"
 
         vulns: list[dict] = []
         # For npm ranges (e.g. "^1.2.3"), we still query OSV using the version candidate.
@@ -287,7 +336,7 @@ async def scan_public_github_repo(repo_url: str) -> dict:
 
     owner, repo = m.group(1), m.group(2)
     branches = ["main", "master"]
-    paths = ["requirements.txt", "package.json", "pom.xml"]
+    paths = ["requirements.txt", "package.json", "pom.xml", "build.gradle", "pubspec.yaml"]
 
     found: list[dict] = []
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), headers={"User-Agent": "cybersecurity-agent/dependency"}) as client:
