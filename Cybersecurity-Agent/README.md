@@ -195,8 +195,12 @@ curl -s http://localhost:8006/health
 - `"Check vulnerabilities for next@15.0.8"`
 - `"Scan ports on example.com"`
 - `"Any vulnerability for example.com"`
+- `"What is the public IP for example.com"`
+- `"Which ports are open for example.com"`
 - `"Analyze risk for CVE-2024-12345 on example.com"`
 - `"Is CVE-2024-12345 exploited?"`
+- `"Explain GHSA-4342-x723-ch2f"`
+- `"Explain vulnerability CVE-2021-44228"`
 - `"Generate a session report"`
 - `"Scan dependencies for https://github.com/org/repo"`
 - `"What is DNS?"`

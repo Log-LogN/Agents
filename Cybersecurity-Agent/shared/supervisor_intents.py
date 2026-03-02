@@ -49,7 +49,10 @@ def extract_advisory_id(text: str) -> str | None:
         return None
     m = re.search(r"\bGHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}\b", text, flags=re.IGNORECASE)
     if m:
-        return m.group(0).upper()
+        raw = m.group(0)
+        # OSV vuln IDs are case-sensitive in the path; normalize GHSA suffix to lowercase.
+        # Example: GHSA-4342-x723-ch2f
+        return "GHSA-" + raw[5:].lower()
     m = re.search(r"\bCVE-\d{4}-\d{4,7}\b", text, flags=re.IGNORECASE)
     if m:
         return m.group(0).upper()

@@ -15,7 +15,8 @@ def extract_advisory_id(message: str) -> str | None:
         return None
     m = _GHSA_RE.search(message)
     if m:
-        return m.group(0).upper()
+        raw = m.group(0)
+        return "GHSA-" + raw[5:].lower()
     m = _CVE_RE.search(message)
     if m:
         return m.group(0).upper()
@@ -86,4 +87,3 @@ async def run_advisory_agent(message: str) -> dict:
 
     artifact = {"type": "advisory", "id": data.get("id", vid), "data": data}
     return {"output": "\n".join(lines), "tool_calls": tool_calls, "artifact": artifact}
-
