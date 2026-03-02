@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import xml.etree.ElementTree as ET
 from typing import Any
 
 import httpx
@@ -67,6 +68,69 @@ def _parse_package_json(content: str) -> list[dict]:
     return deps
 
 
+def _strip_xml_ns(tag: str) -> str:
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+
+def _parse_pom_xml(content: str) -> list[dict]:
+    """
+    Parse Maven pom.xml dependencies from the root <project>.
+
+    Notes:
+    - Best-effort only; property substitution (${...}) is not resolved.
+    - dependencyManagement / parent BOM is not resolved.
+    """
+    deps: list[dict] = []
+    try:
+        root = ET.fromstring(content or "")
+    except Exception:
+        return deps
+
+    # Find direct dependencies under project/dependencies/dependency
+    for elem in root.iter():
+        if _strip_xml_ns(elem.tag) != "dependency":
+            continue
+
+        group_id = None
+        artifact_id = None
+        version = None
+        scope = None
+
+        for child in list(elem):
+            t = _strip_xml_ns(child.tag)
+            if t == "groupId":
+                group_id = (child.text or "").strip()
+            elif t == "artifactId":
+                artifact_id = (child.text or "").strip()
+            elif t == "version":
+                version = (child.text or "").strip()
+            elif t == "scope":
+                scope = (child.text or "").strip()
+
+        if not group_id or not artifact_id:
+            continue
+
+        # Skip test/provided scopes by default (still record for transparency).
+        pinned = bool(version) and ("${" not in (version or "")) and not any(x in (version or "") for x in ("[", "]", "(", ")", ","))
+
+        deps.append(
+            {
+                "name": f"{group_id}:{artifact_id}",
+                "group": group_id,
+                "artifact": artifact_id,
+                "version": version if pinned else None,
+                "pinned": pinned,
+                "raw": version,
+                "scope": scope or "compile",
+                "ecosystem": "Maven",
+            }
+        )
+
+    return deps
+
+
 async def _osv_query(ecosystem: str, name: str, version: str) -> dict:
     url = "https://api.osv.dev/v1/query"
     payload = {"package": {"name": name, "ecosystem": ecosystem}, "version": version}
@@ -105,12 +169,45 @@ async def _latest_npm(name: str) -> str | None:
         return None
 
 
+async def _latest_maven(group: str, artifact: str) -> str | None:
+    """
+    Best-effort Maven latest version via Maven Central metadata.
+    """
+    try:
+        group_path = (group or "").replace(".", "/")
+        url = f"https://repo1.maven.org/maven2/{group_path}/{artifact}/maven-metadata.xml"
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            r = await client.get(url, headers={"User-Agent": "cybersecurity-agent/dependency"})
+            if r.status_code != 200:
+                return None
+            xml = r.text
+        root = ET.fromstring(xml)
+        latest = None
+        for elem in root.iter():
+            if _strip_xml_ns(elem.tag) == "latest" and (elem.text or "").strip():
+                latest = (elem.text or "").strip()
+        if latest:
+            return latest
+        versions = []
+        for elem in root.iter():
+            if _strip_xml_ns(elem.tag) == "version" and (elem.text or "").strip():
+                versions.append((elem.text or "").strip())
+        return versions[-1] if versions else None
+    except Exception:
+        return None
+
+
 async def scan_dependencies_from_text(content: str, file_type: str) -> dict:
     ft = (file_type or "").strip().lower()
-    if ft not in ("requirements.txt", "package.json"):
-        return _failure("file_type must be requirements.txt or package.json")
+    if ft not in ("requirements.txt", "package.json", "pom.xml"):
+        return _failure("file_type must be requirements.txt, package.json, or pom.xml")
 
-    deps = _parse_requirements_txt(content) if ft == "requirements.txt" else _parse_package_json(content)
+    if ft == "requirements.txt":
+        deps = _parse_requirements_txt(content)
+    elif ft == "package.json":
+        deps = _parse_package_json(content)
+    else:
+        deps = _parse_pom_xml(content)
     if not deps:
         return _success({"file_type": ft, "count": 0, "dependencies": []})
 
@@ -121,7 +218,12 @@ async def scan_dependencies_from_text(content: str, file_type: str) -> dict:
         name = dep["name"]
         version = dep.get("version")
         pinned = bool(dep.get("pinned"))
-        ecosystem = "PyPI" if ft == "requirements.txt" else "npm"
+        if ft == "requirements.txt":
+            ecosystem = "PyPI"
+        elif ft == "package.json":
+            ecosystem = "npm"
+        else:
+            ecosystem = "Maven"
 
         vulns: list[dict] = []
         # For npm ranges (e.g. "^1.2.3"), we still query OSV using the version candidate.
@@ -132,7 +234,10 @@ async def scan_dependencies_from_text(content: str, file_type: str) -> dict:
             except Exception as e:
                 logger.warning("OSV query failed for %s: %s", name, str(e))
 
-        latest = await _latest(name, ecosystem)
+        if ecosystem == "Maven":
+            latest = await _latest_maven(dep.get("group") or "", dep.get("artifact") or "")
+        else:
+            latest = await _latest(name, ecosystem)
 
         recs: list[str] = []
         if not pinned:
@@ -182,7 +287,7 @@ async def scan_public_github_repo(repo_url: str) -> dict:
 
     owner, repo = m.group(1), m.group(2)
     branches = ["main", "master"]
-    paths = ["requirements.txt", "package.json"]
+    paths = ["requirements.txt", "package.json", "pom.xml"]
 
     found: list[dict] = []
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), headers={"User-Agent": "cybersecurity-agent/dependency"}) as client:
