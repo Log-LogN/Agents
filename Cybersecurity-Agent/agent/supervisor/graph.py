@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import ast
 from typing import TypedDict, Annotated, List
 
 from langchain_openai import ChatOpenAI
@@ -10,7 +11,7 @@ from langgraph.graph import StateGraph, START, END
 
 from shared.config import settings
 from shared.models import RedisSessionStore
-from shared.supervisor_intents import detect_intent, extract_cve, extract_domain
+from shared.supervisor_intents import detect_intent, extract_cve, extract_domain, extract_github_repo_url
 from agent.recon_graph import run_recon_agent
 from agent.vulnerability_graph import run_vulnerability_agent
 from .mcp_client import get_mcp_tools, get_mcp_tool_map
@@ -39,12 +40,50 @@ def _now_ts() -> int:
 
 
 def _as_dict(result) -> dict:
+    """
+    Normalize LangChain-MCP tool outputs into a dict.
+
+    MCP adapters sometimes return:
+    - dict (already structured)
+    - list[{"text": "...json..."}]
+    - string that is JSON or a Python-literal list containing {"text": "..."}
+    """
     if isinstance(result, dict):
         return result
-    try:
-        return json.loads(str(result))
-    except Exception:
-        return {"raw": str(result)}
+
+    if isinstance(result, list) and result:
+        first = result[0]
+        if isinstance(first, dict) and "text" in first:
+            text = first.get("text")
+            if isinstance(text, str):
+                try:
+                    return json.loads(text)
+                except Exception:
+                    return {"raw": text}
+
+    if isinstance(result, str):
+        s = result.strip()
+        if not s:
+            return {"raw": ""}
+        try:
+            return json.loads(s)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(s)
+                if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) and "text" in parsed[0]:
+                    text = parsed[0].get("text")
+                    if isinstance(text, str):
+                        try:
+                            return json.loads(text)
+                        except Exception:
+                            return {"raw": text}
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+        return {"raw": s}
+
+    return {"raw": str(result)}
 
 
 async def _ainvoke_tool(tool_map: dict, name: str, args: dict) -> tuple[dict, dict]:
@@ -276,6 +315,124 @@ async def _run_session_analysis(session_id: str) -> dict:
     return {"output": output, "tool_calls": [], "artifact": {"type": "session_analysis", "highest": highest, "timestamp": _now_ts()}}
 
 
+async def _run_domain_assessment(message: str) -> dict:
+    tool_map = await get_mcp_tool_map()
+    domain = extract_domain(message)
+    if not domain:
+        return {"output": "Please provide a target domain (e.g., example.com).", "tool_calls": [], "artifact": {"type": "domain"}}
+
+    tool_calls: list[dict] = []
+    dns_res, tc = await _ainvoke_tool(tool_map, "tool_dns_lookup", {"domain": domain})
+    tool_calls.append(tc)
+
+    whois_res, tc = await _ainvoke_tool(tool_map, "tool_whois_lookup", {"domain": domain})
+    tool_calls.append(tc)
+
+    port_res, tc = await _ainvoke_tool(tool_map, "tool_port_scan", {"host": domain})
+    tool_calls.append(tc)
+
+    headers_res, tc = await _ainvoke_tool(tool_map, "tool_http_security_headers", {"host": domain})
+    tool_calls.append(tc)
+
+    ssl_res, tc = await _ainvoke_tool(tool_map, "tool_ssl_info", {"host": domain, "port": 443})
+    tool_calls.append(tc)
+
+    open_ports = []
+    if isinstance(port_res, dict) and port_res.get("status") == "success":
+        open_ports = (port_res.get("data") or {}).get("open_ports") or []
+
+    missing_headers = []
+    if isinstance(headers_res, dict) and headers_res.get("status") == "success":
+        missing_headers = (headers_res.get("data") or {}).get("missing_security_headers") or []
+
+    tls_days = None
+    if isinstance(ssl_res, dict) and ssl_res.get("status") == "success":
+        tls_days = (ssl_res.get("data") or {}).get("days_to_expiry")
+
+    findings: list[str] = []
+    if open_ports:
+        findings.append(f"Internet exposure (open ports: {', '.join(str(p) for p in open_ports)})")
+    else:
+        findings.append("No common ports detected open (limited scan).")
+
+    if missing_headers:
+        findings.append(f"Missing security headers: {', '.join(missing_headers[:6])}" + (" ..." if len(missing_headers) > 6 else ""))
+
+    if tls_days is not None and isinstance(tls_days, int) and tls_days < 30:
+        findings.append(f"TLS certificate expires soon ({tls_days} days).")
+
+    out_lines: list[str] = [f"Domain Assessment: {domain}", "", "Findings:"]
+    if findings:
+        out_lines.extend([f"- {f}" for f in findings])
+    else:
+        out_lines.append("- (none)")
+    output = "\n".join(out_lines)
+
+    artifact = {
+        "type": "domain",
+        "domain": domain,
+        "open_ports": open_ports,
+        "missing_security_headers": missing_headers,
+        "tls_days_to_expiry": tls_days,
+        "timestamp": _now_ts(),
+    }
+
+    return {"output": output, "tool_calls": tool_calls, "artifact": artifact}
+
+
+async def _run_dependency_scan(message: str) -> dict:
+    tool_map = await get_mcp_tool_map()
+    repo_url = extract_github_repo_url(message)
+    if not repo_url:
+        return {
+            "output": "Provide a public GitHub repo URL (e.g., https://github.com/org/repo) to scan dependencies.",
+            "tool_calls": [],
+            "artifact": {"type": "dependency_scan"},
+        }
+
+    tool_calls: list[dict] = []
+    scan_res, tc = await _ainvoke_tool(tool_map, "tool_scan_public_repo", {"repo_url": repo_url})
+    tool_calls.append(tc)
+
+    if not (isinstance(scan_res, dict) and scan_res.get("status") == "success"):
+        return {
+            "output": f"Dependency scan failed: {scan_res.get('error') if isinstance(scan_res, dict) else scan_res}",
+            "tool_calls": tool_calls,
+            "artifact": {"type": "dependency_scan", "repo_url": repo_url, "timestamp": _now_ts()},
+        }
+
+    data = scan_res.get("data") or {}
+    results = data.get("results") or []
+
+    total_deps = 0
+    total_vuln_deps = 0
+    top_findings: list[str] = []
+    for r in results:
+        scan = ((r.get("scan") or {}).get("data") or {}) if isinstance(r.get("scan"), dict) else {}
+        deps = scan.get("dependencies") or []
+        total_deps += len(deps)
+        for d in deps:
+            if (d.get("vulnerability_count") or 0) > 0:
+                total_vuln_deps += 1
+                ids = [v.get("id") for v in (d.get("vulnerabilities") or []) if isinstance(v, dict) and v.get("id")]
+                top_findings.append(f"{d.get('name')} ({d.get('ecosystem')}): {len(ids)} vuln(s) ({', '.join(ids[:3])})")
+
+    out_lines = [
+        "Dependency Scan",
+        "",
+        f"Repo: {repo_url}",
+        f"Files scanned: {data.get('files_found', 0)}",
+        f"Dependencies parsed: {total_deps}",
+        f"Dependencies with vulnerabilities: {total_vuln_deps}",
+    ]
+    if top_findings:
+        out_lines.append("")
+        out_lines.append("Findings:")
+        out_lines.extend([f"- {t}" for t in top_findings[:10]])
+
+    artifact = {"type": "dependency_scan", "repo_url": repo_url, "result": data, "timestamp": _now_ts()}
+    return {"output": "\n".join(out_lines), "tool_calls": tool_calls, "artifact": artifact}
+
 async def _run_reporting(session_id: str) -> dict:
     tool_map = await get_mcp_tool_map()
     report_res, tc = await _ainvoke_tool(tool_map, "tool_generate_session_report", {"session_id": session_id})
@@ -329,6 +486,8 @@ async def execute_node(state: SupervisorState) -> SupervisorState:
         "threat_only": lambda: _run_threat_only(message),
         "session_analysis": lambda: _run_session_analysis(session_id),
         "report_generation": lambda: _run_reporting(session_id),
+        "domain_assessment": lambda: _run_domain_assessment(message),
+        "dependency_scan": lambda: _run_dependency_scan(message),
         "recon_only": lambda: run_recon_agent(state["messages"], recon_tools),
         "direct_answer": _direct_answer,
     }

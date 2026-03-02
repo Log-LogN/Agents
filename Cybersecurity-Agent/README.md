@@ -76,6 +76,8 @@ A comprehensive AI-powered cybersecurity analysis platform built with LangGraph,
    REDIS_PORT=6379
    REDIS_DB=0
    LOG_LEVEL=INFO
+   # Session bucket retention (default 24h)
+   REDIS_SESSION_TTL_SECONDS=86400
    # Optional (improves GitHub exploit signal reliability)
    GITHUB_TOKEN=your_github_token
    # Optional (default 6h)
@@ -93,8 +95,8 @@ A comprehensive AI-powered cybersecurity analysis platform built with LangGraph,
 ```bash
 python mcp_launcher.py
 ```
-This starts the tool servers on ports 8001-8003.
-Phase-1 also starts Threat Intel (8004) and Risk Engine (8005).
+This starts the tool servers on ports 8001-8006.
+Phase-1 includes Threat Intel (8004), Risk Engine (8005), and Dependency Scan (8006).
 
 ### 2. Start Supervisor API
 ```bash
@@ -156,9 +158,11 @@ UI available at `http://localhost:8501`.
 ### Example Queries
 - `"Check vulnerabilities for next@15.0.8"`
 - `"Scan ports on example.com"`
+- `"Any vulnerability for example.com"`
 - `"Analyze risk for CVE-2024-12345 on example.com"`
 - `"Is CVE-2024-12345 exploited?"`
 - `"Generate a session report"`
+- `"Scan dependencies for https://github.com/org/repo"`
 - `"What is DNS?"`
 - `"Analyze CVE-2023-12345"`
 

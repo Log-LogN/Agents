@@ -8,6 +8,8 @@ INTENTS = {
     "threat_only",
     "session_analysis",
     "report_generation",
+    "domain_assessment",
+    "dependency_scan",
     "recon_only",
     "direct_answer",
 }
@@ -34,11 +36,23 @@ def extract_domain(text: str) -> str | None:
     return None
 
 
+def extract_github_repo_url(text: str) -> str | None:
+    if not text:
+        return None
+    m = re.search(r"(https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", text)
+    return m.group(1) if m else None
+
+
 @dataclass(frozen=True)
 class IntentMatch:
     intent: str
     cve: str | None = None
     domain: str | None = None
+
+    @property
+    def repo_url(self) -> str | None:
+        # For dependency_scan, we store the repo URL in domain for compatibility.
+        return self.domain if self.intent == "dependency_scan" else None
 
 
 def detect_intent(message: str) -> IntentMatch:
@@ -52,6 +66,28 @@ def detect_intent(message: str) -> IntentMatch:
     # report_generation
     if "generate report" in msg:
         return IntentMatch("report_generation", cve=cve, domain=domain)
+
+    # dependency_scan (include common typos like "dependecy")
+    repo = extract_github_repo_url(message)
+    if repo and any(
+        k in msg
+        for k in (
+            "dependency",
+            "dependencies",
+            "dependecy",
+            "dependancy",
+            "dependncy",
+            "deps",
+            "sbom",
+            "requirements.txt",
+            "package.json",
+            "scan repo",
+            "repo scan",
+            "scan depend",
+            "audit",
+        )
+    ):
+        return IntentMatch("dependency_scan", cve=None, domain=repo)
 
     # session_analysis
     if any(
@@ -76,9 +112,13 @@ def detect_intent(message: str) -> IntentMatch:
     if cve and domain:
         return IntentMatch("risk_assessment", cve=cve, domain=domain)
 
+    # If a user asks "any vulnerabilities for <domain>" but provides no CVE,
+    # treat this as recon (exposure discovery) rather than threat/risk scoring.
+    if domain and not cve and any(k in msg for k in ("vulnerability", "vulnerable", "vuln", "security issue", "security issues", "any vulnerability")):
+        return IntentMatch("domain_assessment", cve=None, domain=domain)
+
     # recon_only (basic)
     if any(k in msg for k in ("scan ports", "port scan", "dns", "whois", "recon")):
         return IntentMatch("recon_only", cve=cve, domain=domain)
 
     return IntentMatch("direct_answer", cve=cve, domain=domain)
-

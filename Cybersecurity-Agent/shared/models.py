@@ -90,7 +90,11 @@ class RedisSessionStore:
     def save_session_history(self, session_id: str, history: List[Dict[str, Any]]):
         """Save conversation history for a session."""
         try:
-            self.redis.set(f"session:{session_id}:history", json.dumps(history))
+            self.redis.set(
+                f"session:{session_id}:history",
+                json.dumps(history),
+                ex=settings.REDIS_SESSION_TTL_SECONDS,
+            )
         except Exception:
             return
 
@@ -117,7 +121,11 @@ class RedisSessionStore:
             if "timestamp" not in entry:
                 entry["timestamp"] = int(time.time())
             artifacts.append(entry)
-            self.redis.set(f"session:{session_id}:artifacts", json.dumps(artifacts))
+            self.redis.set(
+                f"session:{session_id}:artifacts",
+                json.dumps(artifacts),
+                ex=settings.REDIS_SESSION_TTL_SECONDS,
+            )
         except Exception:
             return
 

@@ -16,14 +16,18 @@ SUPERVISOR_GRAPH = build_supervisor_graph()
 # Load tools once
 @app.on_event("startup")
 async def startup():
-    recon_tools, vuln_tools = await get_mcp_tools()
-    all_tools = await get_all_mcp_tools()
+    try:
+        recon_tools, vuln_tools = await get_mcp_tools()
+        all_tools = await get_all_mcp_tools()
 
-    print("\nSupervisor loaded tools")
-    print("Recon:", [t.name for t in recon_tools])
-    print("Vulnerability:", [t.name for t in vuln_tools])
-    print("All MCP tools:", [t.name for t in all_tools])
-    print()
+        print("\nSupervisor loaded tools")
+        print("Recon:", [t.name for t in recon_tools])
+        print("Vulnerability:", [t.name for t in vuln_tools])
+        print("All MCP tools:", [t.name for t in all_tools])
+        print()
+    except Exception as e:
+        # Don't fail supervisor startup if one MCP server is down.
+        print(f"\nSupervisor startup warning: MCP tools not fully available ({e})\n")
 
 
 @app.post("/chat", response_model=ChatResponse)

@@ -27,6 +27,7 @@ class Settings:
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
     REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
+    REDIS_SESSION_TTL_SECONDS: int = int(os.getenv("REDIS_SESSION_TTL_SECONDS", str(24 * 60 * 60)))
 
     # ── Threat Intel Integrations ───────────────────────────
     GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")

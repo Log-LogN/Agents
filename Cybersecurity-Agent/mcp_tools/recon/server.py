@@ -7,6 +7,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp_tools.recon.tools.dns_lookup import dns_lookup
 from mcp_tools.recon.tools.port_scan import port_scan
 from mcp_tools.recon.tools.whois_lookup import whois_lookup
+from mcp_tools.recon.tools.http_security_headers import http_security_headers
+from mcp_tools.recon.tools.ssl_info import ssl_info
 from shared.models import HealthResponse
 
 mcp = FastMCP("recon-mcp")
@@ -28,6 +30,18 @@ def tool_port_scan(host: str):
 def tool_whois_lookup(domain: str):
     """Get domain registration details."""
     return whois_lookup(domain)
+
+
+@mcp.tool()
+async def tool_http_security_headers(host: str):
+    """Fetch HTTP(S) headers and report common security headers."""
+    return await http_security_headers(host)
+
+
+@mcp.tool()
+def tool_ssl_info(host: str, port: int = 443):
+    """Inspect TLS certificate details for host:port."""
+    return ssl_info(host, port)
 
 
 def create_app():
