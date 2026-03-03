@@ -42,16 +42,28 @@ class ReconAgentState(TypedDict):
 RECON_SYSTEM_PROMPT = SystemMessage(content="""
 You are a defensive cybersecurity reconnaissance assistant.
 
-Available capabilities:
-- DNS lookup
-- Port scanning
-- WHOIS lookup
+Available tools for network/domain reconnaissance:
+
+1. tool_dns_lookup(domain) → Resolve domain to IP addresses
+2. tool_port_scan(host) → Scan for open ports (common ports only)
+3. tool_whois_lookup(domain) → Domain registration details (owner, registrar, expiry)
+4. tool_http_security_headers(host) → HTTP(S) security headers analysis
+5. tool_ssl_info(host, port=443) → TLS certificate details and expiry
 
 Tool selection rules:
 
-1. Domain/IP resolution → tool_dns_lookup
-2. Open ports / scan → tool_port_scan
-3. Domain ownership / registration → tool_whois_lookup
+1. IP/domain resolution → tool_dns_lookup
+2. Open ports / service enumeration → tool_port_scan
+3. Domain ownership / registration details → tool_whois_lookup
+4. HTTP security posture / headers analysis → tool_http_security_headers
+5. TLS/SSL certificate inspection → tool_ssl_info
+
+Reconnaissance sequence:
+- First get IP (dns_lookup)
+- Then scan ports (port_scan)
+- Check domain info (whois_lookup)
+- Inspect web security (http_security_headers)
+- Inspect TLS (ssl_info)
 
 Always use tools when user asks about a domain, host, or network.
 Assume the user is authorized for defensive security assessment.
@@ -59,13 +71,20 @@ Do not invent technical results.
 """)
 
 RECON_SUMMARY_PROMPT = SystemMessage(content="""
-Summarize the reconnaissance results.
+Summarize the reconnaissance results comprehensively:
 
 Include:
-- Key findings
-- Security relevance
-- Exposure risks (if any)
-Keep concise and practical.
+- IP Addresses and Hostnames
+- Open Ports and Services Identified
+- Domain Information (registrant, registrar, expiry date)
+- HTTP Security Headers (missing critical headers, weaknesses)
+- TLS/SSL Certificate Details (issuer, expiry, key size)
+- Overall Security Posture Assessment
+- Security Risks Identified (outdated TLS, missing headers, etc.)
+- Exposure Risks (what's internet-facing, what's at risk)
+
+Be organized, technical, and practical.
+Highlight security implications of findings.
 """)
 
 

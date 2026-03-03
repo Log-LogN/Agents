@@ -147,6 +147,10 @@ def detect_intent(message: str) -> IntentMatch:
         for k in (
             "scan ports",
             "port scan",
+            "open ports",
+            "ports open",
+            "ports are open",
+            "which ports",
             "dns",
             "whois",
             "recon",
