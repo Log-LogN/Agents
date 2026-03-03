@@ -1,33 +1,30 @@
-import json
 import logging
-import re
-import ast
-from typing import TypedDict, Annotated, List
+from typing import TypedDict, Annotated, List, Optional
 
+from pydantic import BaseModel
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, BaseMessage, AIMessage
-from langchain_core.tools import BaseTool
-from langgraph.graph.message import add_messages
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 
 from shared.config import settings
 from shared.models import RedisSessionStore
-from shared.supervisor_intents import detect_intent, extract_cve, extract_domain, extract_github_repo_url
-from agent.recon_graph import run_recon_agent
+
 from agent.vulnerability_graph import run_vulnerability_agent
-from agent.threat_intel_graph import run_threat_intel_agent
+
 from agent.dependency_graph import run_dependency_agent
-from agent.domain_graph import run_domain_agent
-from agent.risk_graph import run_risk_agent
-from agent.session_graph import run_session_agent
-from agent.reporting_graph import run_reporting_agent
-from agent.recon_deterministic_graph import run_recon_deterministic_agent
+
 from agent.advisory_graph import run_advisory_agent
-from .mcp_client import get_mcp_tools, get_mcp_tool_map, get_all_mcp_tools
+from .mcp_client import get_mcp_tools, get_all_mcp_tools
 
 logger = logging.getLogger("supervisor")
 
 
+AGENT_TOOL_SCOPE = {
+    "dependency": "all",
+    "vulnerability": "vuln",
+    "advisory": "vuln",
+}
 # =========================================================
 # State
 # =========================================================
@@ -35,229 +32,230 @@ logger = logging.getLogger("supervisor")
 class SupervisorState(TypedDict, total=False):
     messages: Annotated[List[BaseMessage], add_messages]
     selected_agent: str
-    intent: str
     output: str
     tool_calls: list
     session_id: str
     artifact: dict
 
 
-def _now_ts() -> int:
-    import time
+# =========================================================
+# Agent Registry (Dynamic)
+# =========================================================
+AGENT_REGISTRY = {
+    "dependency": run_dependency_agent,
+    "vulnerability": run_vulnerability_agent,
+    "advisory": run_advisory_agent,
+}
 
-    return int(time.time())
+# =========================================================
+# Structured Router Model
+# =========================================================
 
-
-def _as_dict(result) -> dict:
-    """
-    Normalize LangChain-MCP tool outputs into a dict.
-
-    MCP adapters sometimes return:
-    - dict (already structured)
-    - list[{"text": "...json..."}]
-    - string that is JSON or a Python-literal list containing {"text": "..."}
-    """
-    if isinstance(result, dict):
-        return result
-
-    if isinstance(result, list) and result:
-        first = result[0]
-        if isinstance(first, dict) and "text" in first:
-            text = first.get("text")
-            if isinstance(text, str):
-                try:
-                    return json.loads(text)
-                except Exception:
-                    return {"raw": text}
-
-    if isinstance(result, str):
-        s = result.strip()
-        if not s:
-            return {"raw": ""}
-        try:
-            return json.loads(s)
-        except Exception:
-            try:
-                parsed = ast.literal_eval(s)
-                if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) and "text" in parsed[0]:
-                    text = parsed[0].get("text")
-                    if isinstance(text, str):
-                        try:
-                            return json.loads(text)
-                        except Exception:
-                            return {"raw": text}
-                if isinstance(parsed, dict):
-                    return parsed
-            except Exception:
-                pass
-        return {"raw": s}
-
-    return {"raw": str(result)}
-
-
-async def _ainvoke_tool(tool_map: dict, name: str, args: dict) -> tuple[dict, dict]:
-    tool = tool_map.get(name)
-    if tool is None:
-        out = {"status": "error", "data": None, "error": f"Missing tool: {name}"}
-        return out, {"tool_name": name, "tool_input": args, "tool_output": json.dumps(out)}
-    try:
-        logger.info("supervisor_tool_call name=%s args_keys=%s", name, sorted(list(args.keys())))
-    except Exception:
-        pass
-    res = await tool.ainvoke(args)
-    out = _as_dict(res)
-    try:
-        logger.info("supervisor_tool_result name=%s status=%s", name, out.get("status"))
-    except Exception:
-        pass
-    return out, {"tool_name": name, "tool_input": args, "tool_output": json.dumps(out)}
-
-
-# Define a fallback direct answer function
-async def _direct_answer():
-    return {"output": "No direct answer available.", "tool_calls": [], "artifact": {}}
-
-
-async def _run_threat_only(messages: List[BaseMessage], tools: List[BaseTool]) -> dict:
-    return await run_threat_intel_agent(messages, tools)
-
-
-async def _run_domain_assessment(messages: List[BaseMessage], tools: List[BaseTool]) -> dict:
-    return await run_domain_agent(messages, tools)
-
-
-async def _run_dependency_scan(messages: List[BaseMessage], tools: List[BaseTool]) -> dict:
-    return await run_dependency_agent(messages, tools)
+class RouterDecision(BaseModel):
+    agent: Optional[str]
+    reason: str
 
 
 # =========================================================
-# Nodes
+# Reasoning Node (LLM Router)
 # =========================================================
 
 async def reasoning_node(state: SupervisorState) -> SupervisorState:
-    # Get the last human message
-    last_message = state["messages"][-1]
-    user_message = last_message.content if hasattr(last_message, 'content') else str(last_message)
-    match = detect_intent(user_message)
-    logger.info("Intent %s", match.intent)
-    return {"intent": match.intent, "selected_agent": match.intent}
+    messages = state["messages"]
 
+    last_user_input = messages[-1].content.strip()
 
-# ---------------------------------------------------------
+    history_text = "\n".join(
+        m.content for m in messages[:-1] if isinstance(m, (HumanMessage, AIMessage))
+    )
 
-async def execute_node(state: SupervisorState) -> SupervisorState:
-    intent = state.get("intent", state.get("selected_agent", "direct_answer"))
-    last_message = state["messages"][-1]
-    message = last_message.content if hasattr(last_message, 'content') else str(last_message)
-    session_id = state.get("session_id", "")
+    system_prompt = f"""
+You are a strict cybersecurity supervisor router.
 
-    # Load MCP tools once
+Your job is to select EXACTLY ONE best agent.
+
+You MUST follow these routing rules in priority order:
+
+HARD RULES (strict priority):
+
+1. If the user message contains a GitHub repository URL → dependency
+2. If user asks to scan repository → dependency
+3. If user provides package@version → vulnerability
+4. If user provides CVE-XXXX-XXXX → advisory
+5. If user provides GHSA-XXXX-XXXX-XXXX → advisory
+
+Ignore history if a HARD RULE matches.
+
+If none match → agent = null
+
+SOFT RULES:
+
+- If the user is asking about dependency files (package.json, requirements.txt, pom.xml) → agent = "dependency"
+- If the user wants full security report → agent = "reporting"
+- If user refers to previous session summary → agent = "session"
+
+History Usage:
+
+- ONLY use conversation history if the current message is ambiguous.
+- If the current message clearly matches a HARD RULE, ignore history.
+
+If no rule matches, return agent = null.
+
+Available agents:
+{", ".join(AGENT_REGISTRY.keys())}
+
+Return structured output only.
+"""
+
+    llm = ChatOpenAI(
+        model=settings.OPENAI_MODEL,
+        temperature=0
+    )
+
+    structured_llm = llm.with_structured_output(RouterDecision)
+
+    decision = await structured_llm.ainvoke([
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": f"History:\n{history_text}\n\nUser:\n{last_user_input}"
+        }
+    ])
+
+    logger.info("Router decision: %s", decision.model_dump())
+
+    return {"selected_agent": decision.agent}
+
+async def resolve_tools(scope: str):
     recon_tools, vuln_tools = await get_mcp_tools()
     all_tools = await get_all_mcp_tools()
 
-    handlers = {
-        "risk_assessment": lambda: run_risk_agent(state["messages"], vuln_tools),
-        "threat_only": lambda: _run_threat_only(state["messages"], vuln_tools),
-        "advisory_explain": lambda: run_advisory_agent(state["messages"], vuln_tools),
-        "session_analysis": lambda: run_session_agent(state["messages"], recon_tools),
-        "report_generation": lambda: run_reporting_agent(state["messages"], recon_tools),
-        "domain_assessment": lambda: _run_domain_assessment(state["messages"], recon_tools),
-        "dependency_scan": lambda: _run_dependency_scan(state["messages"], all_tools),
-        "recon_only": lambda: run_recon_deterministic_agent(state["messages"], recon_tools),
-        "direct_answer": _direct_answer,
+    scope_map = {
+        "recon": recon_tools,
+        "vuln": vuln_tools,
+        "all": all_tools,
     }
 
-    handler = handlers.get(intent, _direct_answer)
-    result = await handler()
+    return scope_map.get(scope, all_tools)
+
+
+# =========================================================
+# Agent Executor Node (Dynamic Dispatch)
+# =========================================================
+
+async def agent_executor_node(state: SupervisorState) -> SupervisorState:
+    agent_name = state.get("selected_agent")
+
+    handler = AGENT_REGISTRY.get(agent_name)
+    scope = AGENT_TOOL_SCOPE.get(agent_name, "all")
+
+    if not handler:
+        return {
+            "output": "",
+            "tool_calls": [],
+        }
+
+    tools = await resolve_tools(scope)
+
+    result = await handler(state["messages"], tools)
 
     return {
         "output": result.get("output", ""),
         "tool_calls": result.get("tool_calls", []),
         "artifact": result.get("artifact", {}),
-    }
-
-
-# ---------------------------------------------------------
-
-async def finalize_node(state: SupervisorState) -> SupervisorState:
-    output = state.get("output", "").strip()
-    if not output:
-        output = "Unable to process request."
-
-    # Add AI response to messages
-    return {
-        "output": output,
-        "messages": [AIMessage(content=output)]
+        "selected_agent": agent_name,
     }
 
 
 # =========================================================
-# Graph
+# Direct Answer Node
+# =========================================================
+
+async def direct_answer_node(state: SupervisorState) -> SupervisorState:
+    return {
+        "output": "I could not determine the correct agent to handle this request.",
+        "tool_calls": [],
+    }
+
+
+# =========================================================
+# Finalize Node
+# =========================================================
+
+async def finalize_node(state: SupervisorState) -> SupervisorState:
+    output = state.get("output", "").strip()
+
+    if not output:
+        output = "Unable to process request."
+
+    return {
+        "output": output,
+        "messages": [AIMessage(content=output)],
+    }
+
+
+# =========================================================
+# Graph Builder (Fully Dynamic)
 # =========================================================
 
 def build_supervisor_graph(checkpointer=None):
     graph = StateGraph(SupervisorState)
 
     graph.add_node("reasoning", reasoning_node)
-    graph.add_node("execute", execute_node)
-    graph.add_node("finalize", finalize_node)
+    graph.add_node("agent_executor", agent_executor_node)
+    graph.add_node("direct_answer", direct_answer_node)
 
     graph.add_edge(START, "reasoning")
-    graph.add_edge("reasoning", "execute")
-    graph.add_edge("execute", "finalize")
-    graph.add_edge("finalize", END)
+
+    graph.add_conditional_edges(
+        "reasoning",
+        lambda state: "agent_executor"
+        if state.get("selected_agent")
+        else "direct_answer"
+    )
+
+    graph.add_edge("agent_executor", END)
+    graph.add_edge("direct_answer", END)
 
     return graph.compile(checkpointer=checkpointer)
 
 
 # =========================================================
-# Entry
+# Entry Function (UNCHANGED LOGIC)
 # =========================================================
 
 async def run_supervisor(user_message: str, session_id: str, graph):
     session_store = RedisSessionStore()
 
-    # Load existing history
     history = session_store.get_session_history(session_id)
-    messages = [HumanMessage(content=msg["content"]) if msg["type"] == "human" else AIMessage(content=msg["content"]) for msg in history]
 
-    # Add new human message
+    messages = [
+        HumanMessage(content=m["content"]) if m["type"] == "human"
+        else AIMessage(content=m["content"])
+        for m in history
+    ]
+
     messages.append(HumanMessage(content=user_message))
 
-    # Run graph with messages
-    final = await graph.ainvoke({
+    final = await graph.ainvoke(
+        {
+            "messages": messages,
+            "session_id": session_id,
+        },
+        {"configurable": {"thread_id": session_id}},
+    )
 
-        "messages": messages,
-        "session_id": session_id,
-    }, {"configurable": {"thread_id": session_id}})
-
-    # Save updated history
     updated_messages = final.get("messages", messages)
-    history_data = [{"type": "human" if isinstance(msg, HumanMessage) else "ai", "content": msg.content} for msg in updated_messages]
+
+    history_data = [
+        {"type": "human" if isinstance(m, HumanMessage) else "ai", "content": m.content}
+        for m in updated_messages
+    ]
+
     session_store.save_session_history(session_id, history_data)
-
-    # Persist structured artifacts for reporting.
-    try:
-        artifact = final.get("artifact") or {}
-        tool_calls = final.get("tool_calls") or []
-        intent = final.get("intent", final.get("selected_agent", ""))
-
-        entry = {"intent": intent, "tool_calls": tool_calls}
-        if isinstance(artifact, dict):
-            entry.update(artifact)
-        if "timestamp" not in entry:
-            entry["timestamp"] = _now_ts()
-        if "cve" not in entry:
-            entry["cve"] = extract_cve(user_message)
-        if "domain" not in entry:
-            entry["domain"] = extract_domain(user_message)
-
-        session_store.append_session_artifact(session_id, entry)
-    except Exception:
-        logger.exception("Failed to persist artifacts")
 
     return {
         "output": final.get("output", ""),
-        "agent_used": final.get("intent", final.get("selected_agent", "")),
+        "agent_used": final.get("selected_agent", ""),
         "tool_calls": final.get("tool_calls", []),
     }

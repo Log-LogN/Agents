@@ -1,12 +1,12 @@
 """
-Advisory Agent Internal Graph
-=============================
-Tool-first LangGraph agent for advisory analysis.
-Pattern: agent → tools (loop) → summarize
+Advisory Agent
+==============
+Deterministic advisory lookup agent.
+
+Flow:
+reasoning → tools (once) → summarize → END
 """
 
-import sys
-import os
 import logging
 import time
 import json
@@ -14,13 +14,17 @@ import ast
 from typing import TypedDict, Annotated, List
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AIMessage
+from langchain_core.messages import (
+    HumanMessage,
+    SystemMessage,
+    BaseMessage,
+    AIMessage,
+)
 from langchain_core.tools import BaseTool
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from shared.config import settings
 
 logger = logging.getLogger("advisory-agent")
@@ -31,7 +35,7 @@ logger = logging.getLogger("advisory-agent")
 # =========================================================
 
 class AdvisoryAgentState(TypedDict):
-    messages: Annotated[list[BaseMessage], add_messages]
+    messages: Annotated[List[BaseMessage], add_messages]
     final_output: str
 
 
@@ -42,37 +46,30 @@ class AdvisoryAgentState(TypedDict):
 ADVISORY_SYSTEM_PROMPT = SystemMessage(content="""
 You are a cybersecurity advisory analysis assistant.
 
-Always use tools to retrieve advisory/vulnerability details.
+You MUST perform exactly ONE tool call.
 
-Tool selection rules:
+Rules:
+- If input contains GHSA-XXXX-XXXX-XXXX → tool_get_advisory(vuln_id)
+- If input contains CVE-XXXX-XXXX → tool_get_advisory(vuln_id)
+- If no valid advisory ID is provided → do NOT call tools and ask for a valid ID
 
-1. GHSA ID (e.g., GHSA-xxxx-xxxx-xxxx) 
-   → tool_get_advisory with vuln_id
-
-2. CVE ID (e.g., CVE-2021-44228)
-   → tool_get_advisory with vuln_id
-
-3. Request without specific advisory/CVE ID
-   → Ask user for the specific advisory ID (GHSA or CVE format)
-
-Never invent advisory details.
-Base your answer only on tool results.
-Always retrieve complete advisory information before summarizing.
+Never invent advisory data.
+Do not repeat tool calls.
+Wait for tool result before summarizing.
 """)
 
 ADVISORY_SUMMARY_PROMPT = SystemMessage(content="""
-Provide a detailed summary of the advisory analysis.
+Provide a structured advisory summary including:
 
-Include:
-- Advisory ID (GHSA or CVE)
-- Aliases (other CVE/advisory references)
-- Complete summary/description
-- Severity information (CVSS scores if available, types)
+- Advisory ID
+- Aliases (CVE/GHSA)
+- Description
+- Severity (CVSS if available)
 - Affected packages/ecosystems
-- Recommended actions (upgrade versions, patching guidance)
-- Key references and links
+- Recommended remediation
+- References
 
-Be comprehensive but well-organized.
+Use only tool results.
 """)
 
 
@@ -80,33 +77,21 @@ Be comprehensive but well-organized.
 # Helpers
 # =========================================================
 
-def _now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
 def _extract_tool_output(content):
     try:
         if isinstance(content, dict):
             return content
 
-        if isinstance(content, list):
-            if content and "text" in content[0]:
-                text = content[0]["text"]
-                try:
-                    return json.loads(text)
-                except:
-                    return text
+        if isinstance(content, list) and content:
+            if "text" in content[0]:
+                return json.loads(content[0]["text"])
 
         if isinstance(content, str):
             try:
                 parsed = ast.literal_eval(content)
                 if isinstance(parsed, list) and parsed and "text" in parsed[0]:
-                    text = parsed[0]["text"]
-                    try:
-                        return json.loads(text)
-                    except:
-                        return text
-            except:
+                    return json.loads(parsed[0]["text"])
+            except Exception:
                 pass
 
         return content
@@ -115,24 +100,28 @@ def _extract_tool_output(content):
 
 
 # =========================================================
-# Agent Execution
+# Main Execution
 # =========================================================
 
-async def run_advisory_agent(messages: List[BaseMessage], tools: List[BaseTool]) -> dict:
-    logger.info(f"Advisory agent started: {messages[:100]}")
+async def run_advisory_agent(
+    messages: List[BaseMessage],
+    tools: List[BaseTool],
+) -> dict:
+
+    logger.info("Advisory agent started")
 
     if not tools:
         return {
-            "output": "No advisory tools available.",
-            "tool_calls": []
+            "output": "Advisory tools unavailable.",
+            "tool_calls": [],
         }
 
-    # LLM
     llm = ChatOpenAI(
         model=settings.OPENAI_MODEL,
         api_key=settings.OPENAI_API_KEY,
         temperature=0,
     )
+
     llm_with_tools = llm.bind_tools(tools)
 
     # =====================================================
@@ -143,12 +132,9 @@ async def run_advisory_agent(messages: List[BaseMessage], tools: List[BaseTool])
         response = await llm_with_tools.ainvoke(
             [ADVISORY_SYSTEM_PROMPT] + state["messages"]
         )
-
-        logger.info(f"Tool decision: {getattr(response, 'tool_calls', None)}")
-
         return {"messages": [response]}
 
-    def should_continue(state: AdvisoryAgentState):
+    def route_after_reasoning(state: AdvisoryAgentState):
         last = state["messages"][-1]
         if getattr(last, "tool_calls", None):
             return "tools"
@@ -159,7 +145,11 @@ async def run_advisory_agent(messages: List[BaseMessage], tools: List[BaseTool])
             [ADVISORY_SUMMARY_PROMPT] + state["messages"]
         )
 
-        text = summary.content if isinstance(summary.content, str) else str(summary.content)
+        text = (
+            summary.content
+            if isinstance(summary.content, str)
+            else str(summary.content)
+        )
 
         return {
             "messages": [AIMessage(content=text)],
@@ -167,7 +157,7 @@ async def run_advisory_agent(messages: List[BaseMessage], tools: List[BaseTool])
         }
 
     # =====================================================
-    # Graph
+    # Graph (NO LOOP)
     # =====================================================
 
     graph = StateGraph(AdvisoryAgentState)
@@ -181,16 +171,15 @@ async def run_advisory_agent(messages: List[BaseMessage], tools: List[BaseTool])
 
     graph.add_conditional_edges(
         "reasoning",
-        should_continue,
+        route_after_reasoning,
         {
             "tools": "tools",
             "summarize": "summarize",
-        }
+        },
     )
 
-    # Loop for multiple tool calls
-    graph.add_edge("tools", "reasoning")
-
+    # 🔥 IMPORTANT: tools go directly to summarize
+    graph.add_edge("tools", "summarize")
     graph.add_edge("summarize", END)
 
     compiled_graph = graph.compile()
@@ -200,23 +189,23 @@ async def run_advisory_agent(messages: List[BaseMessage], tools: List[BaseTool])
     # =====================================================
 
     try:
-        initial_state = {"messages": messages}
-        final_state = await compiled_graph.ainvoke(initial_state)
+        final_state = await compiled_graph.ainvoke(
+            {"messages": messages}
+        )
 
         output = final_state.get("final_output", "")
 
-        # Extract tool calls
         tool_calls = []
-        messages = final_state["messages"]
+        final_messages = final_state["messages"]
 
-        for i, msg in enumerate(messages):
-            if hasattr(msg, "tool_calls") and msg.tool_calls:
+        for i, msg in enumerate(final_messages):
+            if getattr(msg, "tool_calls", None):
                 for tc in msg.tool_calls:
                     tool_output = ""
-                    if i + 1 < len(messages):
-                        next_msg = messages[i + 1]
-                        if hasattr(next_msg, "content"):
-                            tool_output = _extract_tool_output(next_msg.content)
+                    if i + 1 < len(final_messages):
+                        tool_output = _extract_tool_output(
+                            final_messages[i + 1].content
+                        )
 
                     tool_calls.append({
                         "tool_name": tc["name"],
@@ -226,14 +215,14 @@ async def run_advisory_agent(messages: List[BaseMessage], tools: List[BaseTool])
 
         return {
             "output": output,
-            "tool_calls": tool_calls
+            "tool_calls": tool_calls,
         }
 
     except Exception as e:
         logger.exception("Advisory agent failed")
         return {
             "output": f"Execution failed: {str(e)}",
-            "tool_calls": []
+            "tool_calls": [],
         }
 
 
@@ -245,7 +234,7 @@ async def run_advisory_agent_stream(message: str, tools: List[BaseTool]):
     yield {
         "event": "agent_started",
         "data": {"agent": "advisory", "message": message},
-        "timestamp": _now_iso(),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
     try:
@@ -253,11 +242,11 @@ async def run_advisory_agent_stream(message: str, tools: List[BaseTool]):
         yield {
             "event": "agent_completed",
             "data": result,
-            "timestamp": _now_iso(),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
     except Exception as e:
         yield {
             "event": "error",
             "data": {"error": str(e)},
-            "timestamp": _now_iso(),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }

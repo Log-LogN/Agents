@@ -11,6 +11,9 @@ import httpx
 
 logger = logging.getLogger("dependency-mcp")
 
+# =========================================================
+# Helpers
+# =========================================================
 
 def _success(data: Any) -> dict:
     return {"status": "success", "data": data, "error": None}
@@ -20,228 +23,99 @@ def _failure(message: str) -> dict:
     return {"status": "error", "data": None, "error": message}
 
 
+# =========================================================
+# Parsing
+# =========================================================
+
 def _parse_requirements_txt(content: str) -> list[dict]:
-    deps: list[dict] = []
-    for raw in (content or "").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or line.startswith("-r ") or line.startswith("--"):
+    deps = []
+    for line in (content or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
             continue
-        m = re.match(r"^([A-Za-z0-9_.-]+)\s*==\s*([A-Za-z0-9_.+-]+)$", line)
+        m = re.match(r"^([A-Za-z0-9_.-]+)==([A-Za-z0-9_.+-]+)$", line)
         if m:
-            deps.append({"name": m.group(1), "version": m.group(2), "pinned": True})
-        else:
-            m2 = re.match(r"^([A-Za-z0-9_.-]+)(.*)$", line)
-            if m2:
-                deps.append({"name": m2.group(1), "version": None, "pinned": False, "raw": line})
+            deps.append({
+                "name": m.group(1),
+                "version": m.group(2),
+                "pinned": True,
+                "ecosystem": "PyPI",
+            })
     return deps
 
 
 def _parse_package_json(content: str) -> list[dict]:
-    deps: list[dict] = []
+    deps = []
     try:
         data = json.loads(content or "{}")
     except Exception:
         return deps
 
-    semver_re = re.compile(r"^\d+\.\d+\.\d+([-.+].+)?$")
-
-    def _add(section: str):
+    for section in ["dependencies", "devDependencies"]:
         items = data.get(section) or {}
-        if isinstance(items, dict):
-            for name, ver in items.items():
-                v = str(ver)
-                cleaned = v.strip().lstrip("^~>=< ").strip()
-                version_candidate = cleaned if semver_re.match(cleaned or "") else None
-                is_exact = bool(version_candidate and v.strip().startswith(version_candidate))
-                deps.append(
-                    {
-                        "name": name,
-                        "version": version_candidate,
-                        "pinned": is_exact,
-                        "raw": v,
-                        "scope": section,
-                    }
-                )
-
-    _add("dependencies")
-    _add("devDependencies")
+        for name, ver in items.items():
+            cleaned = str(ver).strip().lstrip("^~>=< ")
+            deps.append({
+                "name": name,
+                "version": cleaned if cleaned else None,
+                "pinned": not str(ver).startswith(("^", "~")),
+                "ecosystem": "npm",
+            })
     return deps
 
 
-def _strip_xml_ns(tag: str) -> str:
-    if "}" in tag:
-        return tag.split("}", 1)[1]
-    return tag
-
-
 def _parse_pom_xml(content: str) -> list[dict]:
-    """
-    Parse Maven pom.xml dependencies from the root <project>.
-
-    Notes:
-    - Best-effort only; property substitution (${...}) is not resolved.
-    - dependencyManagement / parent BOM is not resolved.
-    """
-    deps: list[dict] = []
+    deps = []
     try:
         root = ET.fromstring(content or "")
     except Exception:
         return deps
 
-    # Find direct dependencies under project/dependencies/dependency
-    for elem in root.iter():
-        if _strip_xml_ns(elem.tag) != "dependency":
-            continue
-
-        group_id = None
-        artifact_id = None
-        version = None
-        scope = None
-
-        for child in list(elem):
-            t = _strip_xml_ns(child.tag)
-            if t == "groupId":
-                group_id = (child.text or "").strip()
-            elif t == "artifactId":
-                artifact_id = (child.text or "").strip()
-            elif t == "version":
-                version = (child.text or "").strip()
-            elif t == "scope":
-                scope = (child.text or "").strip()
-
-        if not group_id or not artifact_id:
-            continue
-
-        # Skip test/provided scopes by default (still record for transparency).
-        pinned = bool(version) and ("${" not in (version or "")) and not any(x in (version or "") for x in ("[", "]", "(", ")", ","))
-
-        deps.append(
-            {
-                "name": f"{group_id}:{artifact_id}",
-                "group": group_id,
-                "artifact": artifact_id,
-                "version": version if pinned else None,
-                "pinned": pinned,
-                "raw": version,
-                "scope": scope or "compile",
-                "ecosystem": "Maven",
-            }
-        )
-
+    for dep in root.iter():
+        if dep.tag.endswith("dependency"):
+            group = artifact = version = None
+            for child in dep:
+                tag = child.tag.split("}")[-1]
+                if tag == "groupId":
+                    group = child.text
+                elif tag == "artifactId":
+                    artifact = child.text
+                elif tag == "version":
+                    version = child.text
+            if group and artifact:
+                deps.append({
+                    "name": f"{group}:{artifact}",
+                    "group": group,
+                    "artifact": artifact,
+                    "version": version,
+                    "pinned": bool(version),
+                    "ecosystem": "Maven",
+                })
     return deps
 
 
-def _parse_build_gradle(content: str) -> list[dict]:
-    deps: list[dict] = []
-    # Simple regex for implementation 'group:artifact:version' or "group:artifact:version"
-    pattern = re.compile(r"[ \t]*(implementation|api|compile|testImplementation|runtimeOnly)[ \t]+['\"]([\w.-]+):([\w.-]+):([\w.-]+)['\"]")
-    for match in pattern.finditer(content or ""):
-        group, artifact, version = match.group(2), match.group(3), match.group(4)
-        deps.append({
-            "name": f"{group}:{artifact}",
-            "group": group,
-            "artifact": artifact,
-            "version": version,
-            "pinned": True,
-            "ecosystem": "Gradle",
-        })
-    return deps
+# =========================================================
+# OSV Query
+# =========================================================
 
-
-def _parse_pubspec_yaml(content: str) -> list[dict]:
-    deps: list[dict] = []
-    in_deps = False
-    for line in (content or "").splitlines():
-        if line.strip().startswith("dependencies:"):
-            in_deps = True
-            continue
-        if in_deps:
-            if not line.strip() or line.startswith(" "):
-                m = re.match(r"^\s*([\w_\-]+):\s*([\w.-]+)?", line)  # removed redundant escape
-                if m:
-                    name = m.group(1)
-                    version = m.group(2) if m.group(2) else None
-                    deps.append({
-                        "name": name,
-                        "version": version,
-                        "pinned": bool(version),
-                        "ecosystem": "Pub",
-                    })
-            else:
-                break
-    return deps
-
-
-async def _osv_query(ecosystem: str, name: str, version: str) -> dict:
+async def _osv_query(ecosystem: str, name: str, version: str):
     url = "https://api.osv.dev/v1/query"
-    payload = {"package": {"name": name, "ecosystem": ecosystem}, "version": version}
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-        r = await client.post(url, json=payload, headers={"User-Agent": "cybersecurity-agent/dependency"})
+    payload = {
+        "package": {"name": name, "ecosystem": ecosystem},
+        "version": version,
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(url, json=payload)
         r.raise_for_status()
         return r.json()
 
 
-def _summarize_osv(v: dict) -> dict:
-    return {"id": v.get("id"), "summary": v.get("summary"), "severity": (v.get("database_specific") or {}).get("severity")}
-
-
-async def _latest_pypi(name: str) -> str | None:
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            r = await client.get(f"https://pypi.org/pypi/{name}/json", headers={"User-Agent": "cybersecurity-agent/dependency"})
-            if r.status_code != 200:
-                return None
-            data = r.json()
-            return ((data.get("info") or {}).get("version")) or None
-    except Exception:
-        return None
-
-
-async def _latest_npm(name: str) -> str | None:
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            r = await client.get(f"https://registry.npmjs.org/{name}", headers={"User-Agent": "cybersecurity-agent/dependency"})
-            if r.status_code != 200:
-                return None
-            data = r.json()
-            tags = data.get("dist-tags") or {}
-            return tags.get("latest")
-    except Exception:
-        return None
-
-
-async def _latest_maven(group: str, artifact: str) -> str | None:
-    """
-    Best-effort Maven latest version via Maven Central metadata.
-    """
-    try:
-        group_path = (group or "").replace(".", "/")
-        url = f"https://repo1.maven.org/maven2/{group_path}/{artifact}/maven-metadata.xml"
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            r = await client.get(url, headers={"User-Agent": "cybersecurity-agent/dependency"})
-            if r.status_code != 200:
-                return None
-            xml = r.text
-        root = ET.fromstring(xml)
-        latest = None
-        for elem in root.iter():
-            if _strip_xml_ns(elem.tag) == "latest" and (elem.text or "").strip():
-                latest = (elem.text or "").strip()
-        if latest:
-            return latest
-        versions = []
-        for elem in root.iter():
-            if _strip_xml_ns(elem.tag) == "version" and (elem.text or "").strip():
-                versions.append((elem.text or "").strip())
-        return versions[-1] if versions else None
-    except Exception:
-        return None
-
+# =========================================================
+# Main Scan Logic
+# =========================================================
 
 async def scan_dependencies_from_text(content: str, file_type: str) -> dict:
-    ft = (file_type or "").strip().lower()
-    if ft not in ("requirements.txt", "package.json", "pom.xml", "build.gradle", "pubspec.yaml"):
-        return _failure("file_type must be requirements.txt, package.json, pom.xml, build.gradle, or pubspec.yaml")
+    ft = (file_type or "").lower()
 
     if ft == "requirements.txt":
         deps = _parse_requirements_txt(content)
@@ -249,194 +123,82 @@ async def scan_dependencies_from_text(content: str, file_type: str) -> dict:
         deps = _parse_package_json(content)
     elif ft == "pom.xml":
         deps = _parse_pom_xml(content)
-    elif ft == "build.gradle":
-        deps = _parse_build_gradle(content)
     else:
-        deps = _parse_pubspec_yaml(content)
+        return _failure("Unsupported file_type")
+
     if not deps:
         return _success({"file_type": ft, "count": 0, "dependencies": []})
 
-    async def _latest(name: str, ecosystem: str) -> str | None:
-        return await (_latest_pypi(name) if ecosystem == "PyPI" else _latest_npm(name))
+    semaphore = asyncio.Semaphore(8)
 
-    async def _scan_one(dep: dict) -> dict:
-        name = dep["name"]
-        version = dep.get("version")
-        pinned = bool(dep.get("pinned"))
-        if ft == "requirements.txt":
-            ecosystem = "PyPI"
-        elif ft == "package.json":
-            ecosystem = "npm"
-        elif ft == "pom.xml":
-            ecosystem = "Maven"
-        elif ft == "build.gradle":
-            ecosystem = "Gradle"
-        else:
-            ecosystem = "Pub"
-
-        vulns: list[dict] = []
-        # For npm ranges (e.g. "^1.2.3"), we still query OSV using the version candidate.
-        if version:
-            try:
-                osv = await _osv_query(ecosystem, name, version)
-                vulns = [_summarize_osv(v) for v in (osv.get("vulns") or [])]
-            except Exception as e:
-                logger.warning("OSV query failed for %s: %s", name, str(e))
-
-        if ecosystem == "Maven":
-            latest = await _latest_maven(dep.get("group") or "", dep.get("artifact") or "")
-        else:
-            latest = await _latest(name, ecosystem)
-
-        recs: list[str] = []
-        if not pinned:
-            recs.append("Pin exact versions (avoid floating ranges) for reproducible triage.")
-        if vulns:
-            recs.append("Upgrade to a non-vulnerable version; validate via OSV/NVD after bump.")
-        if latest and (not version or latest != version):
-            recs.append(f"Consider upgrading to latest: {latest}")
-
-        return {
-            "name": name,
-            "ecosystem": ecosystem,
-            "current_version": version,
-            "latest_version": latest,
-            "pinned": pinned,
-            "vulnerability_count": len(vulns),
-            "vulnerabilities": vulns,
-            "recommendations": recs,
-            **({"raw": dep.get("raw")} if dep.get("raw") else {}),
-            **({"scope": dep.get("scope")} if dep.get("scope") else {}),
-        }
-
-    # Concurrency limit to keep scans fast without overwhelming registries.
-    concurrency = 8
-    semaphore = asyncio.Semaphore(concurrency)
-
-    async def _guard(dep: dict) -> dict:
+    async def _scan(dep: dict):
         async with semaphore:
-            return await _scan_one(dep)
+            vulns = []
+            if dep.get("version"):
+                try:
+                    osv = await _osv_query(
+                        dep["ecosystem"],
+                        dep["name"],
+                        dep["version"],
+                    )
+                    vulns = osv.get("vulns", [])
+                except Exception as e:
+                    logger.warning("OSV error %s: %s", dep["name"], str(e))
 
-    results = await asyncio.gather(*[_guard(d) for d in deps])
+            return {
+                "name": dep["name"],
+                "ecosystem": dep["ecosystem"],
+                "version": dep.get("version"),
+                "pinned": dep.get("pinned"),
+                "vulnerability_count": len(vulns),
+                "vulnerabilities": [
+                    {"id": v.get("id"), "summary": v.get("summary")}
+                    for v in vulns
+                ],
+                "recommendation": (
+                    "Upgrade to latest stable version"
+                    if vulns
+                    else "No known vulnerabilities"
+                ),
+            }
 
-    return _success({"file_type": ft, "count": len(results), "dependencies": results})
+    results = await asyncio.gather(*[_scan(d) for d in deps])
+
+    return _success({
+        "file_type": ft,
+        "count": len(results),
+        "dependencies": results,
+    })
 
 
 async def scan_public_github_repo(repo_url: str) -> dict:
-    """
-    Best-effort scan for common dependency files in a public GitHub repo.
-    Tries main then master for:
-    - requirements.txt
-    - package.json
-    """
     repo_url = (repo_url or "").strip()
+
     m = re.match(r"^https?://github\.com/([^/]+)/([^/]+)$", repo_url.rstrip("/"))
     if not m:
-        return _failure("repo_url must be a GitHub URL like https://github.com/org/repo")
+        return _failure("Invalid GitHub repo URL")
 
-    owner, repo = m.group(1), m.group(2)
+    owner, repo = m.groups()
 
-    candidate_file_types: dict[str, str] = {
-        "requirements.txt": "requirements.txt",
-        "package.json": "package.json",
-        "pom.xml": "pom.xml",
-        "build.gradle": "build.gradle",
-        "build.gradle.kts": "build.gradle",
-        "pubspec.yaml": "pubspec.yaml",
-    }
-
-    async def _default_branch(client: httpx.AsyncClient) -> str | None:
-        try:
-            r = await client.get(f"https://api.github.com/repos/{owner}/{repo}")
-            if r.status_code != 200:
-                return None
-            data = r.json()
-            b = (data.get("default_branch") or "").strip()
-            return b or None
-        except Exception:
-            return None
-
-    async def _repo_tree_paths(client: httpx.AsyncClient, branch: str) -> list[str]:
-        """
-        Best-effort recursive file listing using GitHub Trees API.
-        """
-        try:
-            url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}"
-            r = await client.get(url, params={"recursive": "1"})
-            if r.status_code != 200:
-                return []
-            data = r.json()
-            tree = data.get("tree") or []
-            if not isinstance(tree, list):
-                return []
-            out: list[str] = []
-            for item in tree:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") != "blob":
-                    continue
-                p = item.get("path")
-                if isinstance(p, str) and p:
-                    out.append(p)
-            return out
-        except Exception:
-            return []
-
-    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0), headers={"User-Agent": "cybersecurity-agent/dependency"}) as client:
-        default = await _default_branch(client)
-        branches = [b for b in [default, "main", "master"] if b]
-
-        # Phase 1: Fast path (root manifests on main/master).
-        found: list[dict] = []
-        for path, file_type in candidate_file_types.items():
-            for br in branches:
-                raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{br}/{path}"
+    async with httpx.AsyncClient(timeout=20) as client:
+        for branch in ["main", "master"]:
+            for filename in ["requirements.txt", "package.json", "pom.xml"]:
+                raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{filename}"
                 try:
                     r = await client.get(raw_url)
-                    if r.status_code == 200 and r.text.strip():
-                        found.append({"path": path, "branch": br, "content": r.text, "file_type": file_type})
-                        break
+                    if r.status_code == 200:
+                        scan = await scan_dependencies_from_text(r.text, filename)
+                        return _success({
+                            "repo_url": repo_url,
+                            "file": filename,
+                            "branch": branch,
+                            "scan": scan,
+                        })
                 except Exception:
                     continue
 
-        # Phase 2: Recursive discovery (pom.xml is often not at repo root).
-        if not found:
-            for br in branches:
-                all_paths = await _repo_tree_paths(client, br)
-                if not all_paths:
-                    continue
-                matches = []
-                for p in all_paths:
-                    base = p.rsplit("/", 1)[-1]
-                    if base in candidate_file_types:
-                        matches.append(p)
-
-                # Prefer root-level and first few module manifests.
-                matches.sort(key=lambda p: (p.count("/"), p))
-                matches = matches[:6]
-
-                for p in matches:
-                    base = p.rsplit("/", 1)[-1]
-                    file_type = candidate_file_types.get(base)
-                    if not file_type:
-                        continue
-                    raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{br}/{p}"
-                    try:
-                        r = await client.get(raw_url)
-                        if r.status_code == 200 and r.text.strip():
-                            found.append({"path": p, "branch": br, "content": r.text, "file_type": file_type})
-                    except Exception:
-                        continue
-
-                if found:
-                    break
-
-    if not found:
-        return _success({"repo_url": repo_url, "files_found": 0, "results": []})
-
-    results: list[dict] = []
-    for f in found:
-        scan = await scan_dependencies_from_text(f["content"], f["file_type"])
-        results.append({"path": f["path"], "branch": f["branch"], "scan": scan})
-
-    return _success({"repo_url": repo_url, "files_found": len(found), "results": results})
+    return _success({
+        "repo_url": repo_url,
+        "files_found": 0,
+        "scan": None,
+    })

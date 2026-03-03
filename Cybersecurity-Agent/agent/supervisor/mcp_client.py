@@ -1,68 +1,114 @@
 import asyncio
 import logging
+from typing import Dict, List
 
+from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 logger = logging.getLogger("supervisor-mcp-client")
 
-_tools_cache = None
+# =========================================================
+# MCP Server Configuration
+# =========================================================
 
 MCP_SERVERS = {
-    "recon": {"url": "http://localhost:8001/sse", "transport": "sse"},
-    "reporting": {"url": "http://localhost:8002/sse", "transport": "sse"},
-    "vulnerability": {"url": "http://localhost:8003/sse", "transport": "sse"},
-    "threat_intel": {"url": "http://localhost:8004/sse", "transport": "sse"},
-    "risk_engine": {"url": "http://localhost:8005/sse", "transport": "sse"},
-    "dependency": {"url": "http://localhost:8006/sse", "transport": "sse"},
+    "vulnerability": {
+        "url": "http://localhost:8001/sse",
+        "transport": "sse",
+    },
+    "dependency": {
+        "url": "http://localhost:8002/sse",
+        "transport": "sse",
+    },
 }
 
+# In-memory cache
+_tools_cache: List[BaseTool] | None = None
 
-async def get_all_mcp_tools():
+
+# =========================================================
+# Load All Tools (Cached)
+# =========================================================
+
+async def get_all_mcp_tools() -> List[BaseTool]:
     """
-    Return all MCP tools (cached) as a list of LangChain tools.
+    Load all tools from configured MCP servers.
+    Results are cached after first load.
     """
     global _tools_cache
-    if _tools_cache is None:
-        tools = []
 
-        async def _load_one(name: str, cfg: dict):
-            try:
-                client = MultiServerMCPClient({name: cfg})
-                return await client.get_tools()
-            except Exception as e:
-                logger.warning("MCP server %s unavailable: %s", name, str(e))
-                return []
+    if _tools_cache is not None:
+        return _tools_cache
 
-        tasks = [_load_one(name, cfg) for name, cfg in MCP_SERVERS.items()]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-        for lst in results:
-            tools.extend(lst)
+    tools: List[BaseTool] = []
 
-        _tools_cache = tools
-    return _tools_cache
+    async def _load_server(name: str, cfg: dict) -> List[BaseTool]:
+        try:
+            client = MultiServerMCPClient({name: cfg})
+            server_tools = await client.get_tools()
+            logger.info("Loaded %d tools from %s", len(server_tools), name)
+            return server_tools
+        except Exception as e:
+            logger.warning("MCP server '%s' unavailable: %s", name, str(e))
+            return []
+
+    tasks = [_load_server(name, cfg) for name, cfg in MCP_SERVERS.items()]
+    results = await asyncio.gather(*tasks)
+
+    for server_tools in results:
+        tools.extend(server_tools)
+
+    _tools_cache = tools
+    return tools
 
 
-async def get_mcp_tool_map():
+# =========================================================
+# Tool Map (Deterministic Invocation)
+# =========================================================
+
+async def get_mcp_tool_map() -> Dict[str, BaseTool]:
     """
-    Return a name->tool map for deterministic tool invocation.
+    Return mapping: tool_name -> tool instance
+    Useful for deterministic invocation.
     """
     tools = await get_all_mcp_tools()
-    return {t.name: t for t in tools}
+    return {tool.name: tool for tool in tools}
 
+
+# =========================================================
+# Tool Scopes for Supervisor
+# =========================================================
 
 async def get_mcp_tools():
     """
-    Backwards-compatible helper used by existing agent graphs.
+    Return categorized tool groups for agents.
+
+    Returns:
+        dependency_tools
+        vulnerability_tools
     """
+
     tools = await get_all_mcp_tools()
-    recon_tools = [
-        t
-        for t in tools
-        if t.name.startswith(("tool_dns_", "tool_port_", "tool_whois_", "tool_http_", "tool_ssl_"))
+
+    dependency_tools = [
+        t for t in tools
+        if t.name.startswith((
+            "tool_scan_public_repo",
+            "tool_scan_dependency_text",
+        ))
     ]
-    vuln_tools = [
-        t
-        for t in tools
-        if t.name.startswith(("tool_cve_", "tool_get_cvss", "tool_product_", "tool_osv_", "tool_validate_", "tool_cross_"))
+
+    vulnerability_tools = [
+        t for t in tools
+        if t.name.startswith((
+            "tool_cve_",
+            "tool_get_cvss",
+            "tool_get_advisory",
+            "tool_product_",
+            "tool_osv_",
+            "tool_validate_",
+            "tool_cross_",
+        ))
     ]
-    return recon_tools, vuln_tools
+
+    return dependency_tools, vulnerability_tools
