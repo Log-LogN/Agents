@@ -241,8 +241,10 @@ def build_supervisor_graph(checkpointer=None):
         else "direct_answer"
     )
 
-    graph.add_edge("agent_executor", END)
-    graph.add_edge("direct_answer", END)
+    graph.add_node("finalize", finalize_node)
+    graph.add_edge("agent_executor", "finalize")
+    graph.add_edge("direct_answer", "finalize")
+    graph.add_edge("finalize", END)
 
     return graph.compile(checkpointer=checkpointer)
 
@@ -280,6 +282,15 @@ async def run_supervisor(user_message: str, session_id: str, graph):
     ]
 
     session_store.save_session_history(session_id, history_data)
+
+    # Save artifacts for the individual turn
+    artifact = final.get("artifact") or {}
+    if artifact:
+        session_store.append_session_artifact(session_id, {
+            "intent": artifact.get("intent") or agent_used,
+            "tool_calls": final.get("tool_calls", []),
+            "timestamp": int(time.time()),
+        })
 
     # Coerce selected_agent to a safe string (empty string if None). This
     # prevents None from being returned to the API which expects a string.

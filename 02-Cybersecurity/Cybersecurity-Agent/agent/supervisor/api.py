@@ -86,6 +86,13 @@ async def get_chat_history(session_id: str):
     return {"history": history}
 
 
+@app.get("/chat/artifacts/{session_id}")
+async def get_chat_artifacts(session_id: str):
+    session_store = RedisSessionStore()
+    artifacts = session_store.get_session_artifacts(session_id)
+    return {"artifacts": artifacts}
+
+
 @app.get("/chat/report/{session_id}")
 async def download_session_report(session_id: str):
     """Return a PDF report for the session (history + artifacts)."""
@@ -110,18 +117,39 @@ async def download_session_report(session_id: str):
 MANIFEST_TYPE_HINT = ", ".join(supported_manifest_types())
 
 
-async def _run_manifest_scan(content: str, manifest_type: str) -> dict:
+async def _run_manifest_scan(content: str, manifest_type: str, session_id: str | None = None) -> dict:
     dependency_tools, _ = await get_mcp_tools()
     if not dependency_tools:
         raise HTTPException(status_code=503, detail="Dependency scanning tools are unavailable")
 
     message = HumanMessage(content=f"Scan the following {manifest_type} dependency manifest for vulnerabilities:\n{content}")
     result = await run_dependency_agent([message], dependency_tools)
-    return {
+    
+    scan_results = {
         "summary": result.get("output", ""),
         "scan": _parse_dependency_tool_output(result.get("tool_calls", [])),
         "tool_calls": result.get("tool_calls", []),
     }
+
+    if session_id:
+        session_store = RedisSessionStore()
+        
+        # 1. Save summary to history
+        history = session_store.get_session_history(session_id)
+        history.append({"type": "human", "content": f"Uploaded {manifest_type} manifest for analysis."})
+        history.append({"type": "ai", "content": scan_results["summary"]})
+        session_store.save_session_history(session_id, history)
+        
+        # 2. Save detailed scan to artifacts
+        session_store.append_session_artifact(session_id, {
+            "type": "manifest_scan",
+            "manifest_type": manifest_type,
+            "scan_data": scan_results["scan"],
+            "tool_calls": scan_results["tool_calls"],
+            "intent": "Dependency Scanner"
+        })
+
+    return scan_results
 
 
 def _parse_dependency_tool_output(tool_calls: list[dict]) -> dict | None:
@@ -141,7 +169,7 @@ def _parse_dependency_tool_output(tool_calls: list[dict]) -> dict | None:
 
 
 @app.post("/dependency/manifest")
-async def scan_dependency_manifest(req: DependencyManifestRequest):
+async def scan_dependency_manifest(req: DependencyManifestRequest, session_id: str | None = None):
     normalized = canonicalize_manifest_type(req.file_type, None)
     if not normalized:
         raise HTTPException(
@@ -150,13 +178,14 @@ async def scan_dependency_manifest(req: DependencyManifestRequest):
         )
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="Manifest content must not be empty")
-    return await _run_manifest_scan(req.content.strip(), normalized)
+    return await _run_manifest_scan(req.content.strip(), normalized, session_id or req.session_id)
 
 
 @app.post("/dependency/manifest/upload")
 async def upload_dependency_manifest(
     file: UploadFile = File(...),
     file_type: str | None = Form(None),
+    session_id: str | None = Form(None),
 ):
     normalized = canonicalize_manifest_type(file_type, file.filename)
     if not normalized:
@@ -168,4 +197,4 @@ async def upload_dependency_manifest(
     text = content.decode("utf-8", errors="replace").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
-    return await _run_manifest_scan(text, normalized)
+    return await _run_manifest_scan(text, normalized, session_id)
