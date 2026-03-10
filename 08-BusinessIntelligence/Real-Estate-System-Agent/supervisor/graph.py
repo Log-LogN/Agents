@@ -180,27 +180,16 @@ async def build_graph():
 
     client = MultiServerMCPClient(SPECIALIST_SERVERS)
     all_tools = await client.get_tools()
-
-    def _match(tools, *keywords):
-        matched = [t for t in tools if any(k in t.name.lower() for k in keywords)]
-        return matched if matched else []
-
-    listing_tools   = _match(all_tools, "listing","list_propert","change_listing","agent_listing","new_listing")
-    client_tools    = _match(all_tools, "register_buyer","register_seller","get_client","update_client","get_leads","update_lead","log_interaction","send_followup")
-    search_tools    = _match(all_tools, "search_propert","recommendations","save_search","saved_search","nearby","compare","property_matches","search_analytics")
-    viewing_tools   = _match(all_tools, "viewing","book_viewing","reschedule","cancel_viewing","viewing_schedule","viewing_feedback","viewing_history","viewing_remind","viewing_stat")
-    offer_tools     = _match(all_tools, "submit_offer","update_offer","counteroffer","offer_history","deal_pipeline","accept_offer","offer_status","deal_stat")
-    document_tools  = _match(all_tools, "contract","document","kyc","compliance","transaction_doc")
-    analytics_tools = _match(all_tools, "valuation","comparable","price_trend","market_summary","rental_yield","top_areas","investment","market_report")
+    tools_all = all_tools
 
     # Specialist agents
-    listing_agent   = _make_agent(llm, listing_tools,   LISTING_PROMPT)
-    client_agent    = _make_agent(llm, client_tools,    CLIENT_PROMPT)
-    search_agent    = _make_agent(llm, search_tools,    SEARCH_PROMPT)
-    viewing_agent   = _make_agent(llm, viewing_tools,   VIEWING_PROMPT)
-    offer_agent     = _make_agent(llm, offer_tools,     OFFER_PROMPT)
-    document_agent  = _make_agent(llm, document_tools,  DOCUMENT_PROMPT)
-    analytics_agent = _make_agent(llm, analytics_tools, ANALYTICS_PROMPT)
+    listing_agent   = _make_agent(llm, tools_all, LISTING_PROMPT)
+    client_agent    = _make_agent(llm, tools_all, CLIENT_PROMPT)
+    search_agent    = _make_agent(llm, tools_all, SEARCH_PROMPT)
+    viewing_agent   = _make_agent(llm, tools_all, VIEWING_PROMPT)
+    offer_agent     = _make_agent(llm, tools_all, OFFER_PROMPT)
+    document_agent  = _make_agent(llm, tools_all, DOCUMENT_PROMPT)
+    analytics_agent = _make_agent(llm, tools_all, ANALYTICS_PROMPT)
 
     # Embedded general agent — no tools, no server
     general_node = _make_general_node(llm)
@@ -211,45 +200,23 @@ async def build_graph():
                 return str(msg.content)
         return ""
 
-    def _extract_transfer_name(raw: str) -> str:
-        allowed = [
-            "transfer_to_listing",
-            "transfer_to_client",
-            "transfer_to_search",
-            "transfer_to_viewing",
-            "transfer_to_offer",
-            "transfer_to_document",
-            "transfer_to_analytics",
-            "transfer_to_general",
-        ]
-        text = (raw or "").strip().lower()
-        for name in allowed:
-            if name in text:
-                return name
-        return "transfer_to_general"
+    _ALLOWED_TRANSFERS = {
+        "transfer_to_listing",
+        "transfer_to_client",
+        "transfer_to_search",
+        "transfer_to_viewing",
+        "transfer_to_offer",
+        "transfer_to_document",
+        "transfer_to_analytics",
+        "transfer_to_general",
+    }
 
-    def _fallback_transfer_name(user_text: str) -> str:
-        text = (user_text or "").lower()
-        if any(k in text for k in ("listing", "listings", "delist", "under_offer", "sold", "listing statistics", "property listing statistics")):
-            return "transfer_to_listing"
-        if any(k in text for k in ("buyer", "seller", "lead", "crm", "client profile", "follow-up")):
-            return "transfer_to_client"
-        if any(k in text for k in ("search", "find property", "recommend", "compare properties", "nearby")):
-            return "transfer_to_search"
-        if any(k in text for k in ("viewing", "appointment", "book viewing", "reschedule", "cancel viewing", "open house")):
-            return "transfer_to_viewing"
-        if any(k in text for k in ("offer", "counteroffer", "deal pipeline", "deal statistics", "negotiation")):
-            return "transfer_to_offer"
-        if any(k in text for k in ("document", "agreement", "kyc", "compliance", "sale deed", "contract")):
-            return "transfer_to_document"
-        if any(k in text for k in ("valuation", "market summary", "price trend", "rental yield", "investment", "roi", "absorption")):
-            return "transfer_to_analytics"
-        return "transfer_to_general"
+    def _normalize_transfer_name(raw: str) -> str:
+        text = (raw or "").strip().lower()
+        return text if text in _ALLOWED_TRANSFERS else "transfer_to_general"
 
     async def supervisor_agent(state: RealEstateState) -> dict:
         user_text = _latest_user_text(state)
-        # Deterministic first-pass routing avoids LLM misroutes on clear intents.
-        deterministic_route = _fallback_transfer_name(user_text)
         route_prompt = (
             f"{SUPERVISOR_PROMPT}\n\n"
             "Return exactly one route token from this set, and nothing else:\n"
@@ -262,17 +229,15 @@ async def build_graph():
             "transfer_to_analytics\n"
             "transfer_to_general"
         )
-        transfer_name = deterministic_route
-        if deterministic_route == "transfer_to_general":
-            try:
-                route_llm = await llm.ainvoke([
-                    SystemMessage(content=route_prompt),
-                    HumanMessage(content=user_text),
-                ])
-                transfer_name = _extract_transfer_name(str(route_llm.content))
-            except Exception as exc:
-                log.warning("Supervisor LLM routing failed, using fallback router: %s", exc)
-                transfer_name = deterministic_route
+        try:
+            route_llm = await llm.ainvoke([
+                SystemMessage(content=route_prompt),
+                HumanMessage(content=user_text),
+            ])
+            transfer_name = _normalize_transfer_name(str(route_llm.content))
+        except Exception as exc:
+            log.warning("Supervisor LLM routing failed, using general route: %s", exc)
+            transfer_name = "transfer_to_general"
         tool_call_id = "route-1"
         routed_label = transfer_name.replace("transfer_to_", "").replace("_", " ").title()
         route_message = AIMessage(
@@ -287,24 +252,28 @@ async def build_graph():
         return {"messages": [route_message, route_result]}
 
     # ── Router ─────────────────────────────────────────────────────────────
+    _TRANSFER_TO_NODE = {
+        "transfer_to_listing": "listing_agent",
+        "transfer_to_client": "client_agent",
+        "transfer_to_search": "search_agent",
+        "transfer_to_viewing": "viewing_agent",
+        "transfer_to_offer": "offer_agent",
+        "transfer_to_document": "document_agent",
+        "transfer_to_analytics": "analytics_agent",
+        "transfer_to_general": "general_node",
+    }
+
     def _route(state: RealEstateState) -> str:
         for msg in reversed(state.get("messages", [])):
             if not isinstance(msg, AIMessage):
                 continue
             calls = getattr(msg, "tool_calls", None) or []
-            for tc in calls:
-                name = tc.get("name", "")
-                if "listing"   in name: return "listing_agent"
-                if "client"    in name: return "client_agent"
-                if "search"    in name: return "search_agent"
-                if "viewing"   in name: return "viewing_agent"
-                if "offer"     in name: return "offer_agent"
-                if "document"  in name: return "document_agent"
-                if "analytics" in name: return "analytics_agent"
-                if "general"   in name: return "general_node"
+            if calls:
+                name = calls[0].get("name", "")
+                return _TRANSFER_TO_NODE.get(name, "general_node")
             if msg.content and not calls:
                 return END
-        return "general_node"   # hard fallback — always answers
+        return "general_node"   # hard fallback -- always answers
 
     # ── Assemble graph ──────────────────────────────────────────────────────
     graph = StateGraph(RealEstateState)
