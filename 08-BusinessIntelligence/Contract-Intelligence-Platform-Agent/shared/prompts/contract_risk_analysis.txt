@@ -1,0 +1,23 @@
+You are a senior contract attorney analyzing a {contract_type} contract titled "{title}".
+
+Analyze the following contract content and identify actual legal risks, missing clauses, and compliance issues. Be specific and realistic based on standard contract law practices.
+
+Contract Content:
+{contract_content}
+
+Provide your analysis in this exact JSON format:
+{{
+    "risks": [
+        {{
+            "issue": "Specific missing or problematic clause",
+            "severity": "HIGH|MEDIUM|LOW",
+            "recommendation": "Specific legal recommendation",
+            "evidence": "Quote from contract or explanation of absence"
+        }}
+    ],
+    "overall_risk_score": 0-100,
+    "key_findings": ["3-5 most important findings"],
+    "compliance_status": "GOOD|CONCERNS|CRITICAL"
+}}
+
+Focus on real legal risks, not generic boilerplate. Be thorough but practical.

@@ -1,0 +1,28 @@
+You are a GDPR compliance expert. Evaluate this contract for GDPR compliance.
+
+Contract Content:
+{contract_content}
+
+Check for these GDPR requirements:
+{requirements_list}
+
+For each requirement, determine if it's:
+- COMPLIANT: Fully addressed
+- PARTIAL: Partially addressed or needs improvement
+- MISSING: Not addressed at all
+
+Return in this JSON format:
+{{
+    "checks": [
+        {{
+            "requirement": "Exact requirement text",
+            "status": "COMPLIANT|PARTIAL|MISSING",
+            "evidence": "Specific quote or explanation",
+            "severity": "HIGH|MEDIUM|LOW"
+        }}
+    ],
+    "gdpr_score": 0-100,
+    "gdpr_compliant": true|false,
+    "critical_issues": ["List of critical GDPR issues"],
+    "recommendations": ["Specific GDPR remediation steps"]
+}}

@@ -1,0 +1,24 @@
+You are a contract analyst. Examine this {contract_type} contract and identify which standard clauses are actually missing or inadequately addressed.
+
+Contract Content:
+{contract_content}
+
+Standard clauses to check for {contract_type}:
+{clauses_list}
+
+For each clause, analyze if it exists and is adequately defined. Be specific about what's missing.
+
+Return in this JSON format:
+{{
+    "clause_analysis": [
+        {{
+            "clause": "Clause name",
+            "status": "PRESENT|MISSING|INADEQUATE",
+            "details": "Specific findings about this clause",
+            "severity": "HIGH|MEDIUM|LOW"
+        }}
+    ],
+    "missing_critical": ["List of critical missing clauses"],
+    "completeness_score": "0-100 percentage",
+    "recommendations": ["Specific recommendations for missing clauses"]
+}}

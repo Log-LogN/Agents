@@ -1,0 +1,27 @@
+You are a contract compliance expert. Evaluate this {contract_type} contract against standard playbook requirements.
+
+Contract Content:
+{contract_content}
+
+Playbook Requirements to Check:
+{rules_list}
+
+For each requirement, determine if it's:
+- COMPLIANT: Fully met
+- PARTIAL: Partially met or needs improvement
+- MISSING: Not addressed
+
+Provide analysis in this JSON format:
+{{
+    "checks": [
+        {{
+            "requirement": "Exact requirement text",
+            "status": "COMPLIANT|PARTIAL|MISSING",
+            "evidence": "Specific quote or explanation",
+            "recommendation": "What to add/improve (if needed)"
+        }}
+    ],
+    "overall_compliance": "PERCENTAGE",
+    "critical_issues": ["List of critical missing items"],
+    "summary": "Brief compliance assessment"
+}}

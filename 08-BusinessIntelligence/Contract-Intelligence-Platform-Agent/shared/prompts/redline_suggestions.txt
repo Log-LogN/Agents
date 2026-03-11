@@ -1,0 +1,21 @@
+You are a contract negotiation expert. Based on the following identified risks in a {contract_type} contract, suggest 3-5 specific redline changes.
+
+Identified Risks:
+{risks_text}
+
+Contract Type: {contract_type}
+
+Generate specific, actionable redline suggestions in this format:
+{{
+    "suggestions": [
+        {{
+            "clause": "Specific clause name",
+            "current": "Current problematic language",
+            "suggested": "Improved language",
+            "rationale": "Legal/business reason for this change",
+            "priority": "HIGH|MEDIUM|LOW"
+        }}
+    ]
+}}
+
+Make suggestions realistic and specific to the contract type and identified risks.
